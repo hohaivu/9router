@@ -1,5 +1,7 @@
 import "open-sse/index.js";
 
+import { createHash } from "node:crypto";
+
 import {
   getProviderCredentials,
   markAccountUnavailable,
@@ -19,6 +21,60 @@ import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
 import { updateProviderCredentials, checkAndRefreshToken } from "../services/tokenRefresh.js";
 import { getProjectIdForConnection } from "open-sse/services/projectId.js";
+
+function hashFingerprint(value) {
+  if (value === null || value === undefined) return null;
+  return createHash("sha256").update(String(value)).digest("hex").slice(0, 12);
+}
+
+function fingerprintMessage(message) {
+  if (!message) return null;
+
+  const content = message.content;
+  const contentFingerprint = Array.isArray(content)
+    ? content.map((part) => {
+        if (part && typeof part === "object") {
+          return {
+            type: part.type || null,
+            text: typeof part.text === "string" ? part.text : null,
+            has_image_url: !!part.image_url,
+            has_input_audio: !!part.input_audio,
+            has_file: !!part.file,
+          };
+        }
+        return part;
+      })
+    : content;
+
+  const payload = {
+    role: message.role || null,
+    content: contentFingerprint,
+    name: message.name || null,
+    tool_call_id: message.tool_call_id || null,
+    tool_calls: Array.isArray(message.tool_calls)
+      ? message.tool_calls.map((toolCall) => ({
+          id: toolCall?.id || null,
+          type: toolCall?.type || null,
+          name: toolCall?.function?.name || toolCall?.name || null,
+        }))
+      : null,
+  };
+
+  return hashFingerprint(JSON.stringify(payload));
+}
+
+function buildAffinityContext(body, apiKey, modelStr) {
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const activeMessages = messages.filter((message) => message && message.role !== "system" && message.role !== "tool");
+  const firstActiveMessage = activeMessages[0] || null;
+
+  return {
+    apiKeyFingerprint: hashFingerprint(apiKey),
+    routedModel: modelStr || null,
+    firstActiveMessageHash: fingerprintMessage(firstActiveMessage),
+    toolCount: Array.isArray(body.tools) ? body.tools.length : 0,
+  };
+}
 
 /**
  * Handle chat completion request
@@ -45,6 +101,8 @@ export async function handleChat(request, clientRawRequest = null) {
   }
   cacheClaudeHeaders(clientRawRequest.headers);
 
+  const apiKey = extractApiKey(request);
+
   // Log request endpoint and model
   const url = new URL(request.url);
   const modelStr = body.model;
@@ -57,7 +115,6 @@ export async function handleChat(request, clientRawRequest = null) {
 
   // Log API key (masked)
   const authHeader = request.headers.get("Authorization");
-  const apiKey = extractApiKey(request);
   if (authHeader && apiKey) {
     const masked = log.maskKey(apiKey);
     log.debug("AUTH", `API Key: ${masked}`);
@@ -164,7 +221,8 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
   let lastStatus = null;
 
   while (true) {
-    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model);
+    const affinityContext = buildAffinityContext(body, apiKey, `${provider}/${model}`);
+    const credentials = await getProviderCredentials(provider, excludeConnectionIds, model, affinityContext);
 
     // All accounts unavailable
     if (!credentials || credentials.allRateLimited) {

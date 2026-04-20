@@ -7,6 +7,38 @@ import * as log from "../utils/logger.js";
 
 // Mutex to prevent race conditions during account selection
 let selectionMutex = Promise.resolve();
+// In-memory affinity map: affinityKey -> connectionId
+const affinityAssignments = new Map();
+
+function buildAffinityKey(affinityContext) {
+  if (!affinityContext) return null;
+
+  const apiKeyFingerprint = affinityContext.apiKeyFingerprint ? String(affinityContext.apiKeyFingerprint) : null;
+  const routedModel = affinityContext.routedModel ? String(affinityContext.routedModel) : null;
+  const firstActiveMessageHash = affinityContext.firstActiveMessageHash ? String(affinityContext.firstActiveMessageHash) : null;
+
+  if (!apiKeyFingerprint || !routedModel || !firstActiveMessageHash) return null;
+
+  return `${apiKeyFingerprint}:${routedModel}:${firstActiveMessageHash}`;
+}
+
+function pickWeakTieBreaker(candidates, affinityContext, affinityKey = "") {
+  if (!Array.isArray(candidates) || candidates.length <= 1) return candidates?.[0] || null;
+
+  const toolCount = Number(affinityContext?.toolCount || 0);
+  const seed = `${affinityKey}:${toolCount}:${candidates.length}`;
+  const hashed = Array.from(seed).reduce((sum, char) => (sum * 31 + char.charCodeAt(0)) >>> 0, 7);
+  return candidates[hashed % candidates.length];
+}
+
+async function touchSelectedConnection(connection, strategy) {
+  if (strategy !== "round-robin") return;
+
+  await updateProviderConnection(connection.id, {
+    lastUsedAt: new Date().toISOString(),
+    consecutiveUseCount: (connection.consecutiveUseCount || 0) + 1
+  });
+}
 
 /**
  * Get provider credentials from localDb
@@ -14,6 +46,7 @@ let selectionMutex = Promise.resolve();
  * @param {string} provider - Provider name
  * @param {Set<string>|string|null} excludeConnectionIds - Connection ID(s) to exclude (for retry with next account)
  * @param {string|null} model - Model name for per-model rate limit filtering
+ * @param {object|null} affinityContext - Optional affinity inputs from request
  */
 export async function getProviderCredentials(provider, excludeConnectionIds = null, model = null, options = {}) {
   // Normalize to Set for consistent handling
@@ -21,6 +54,7 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     ? excludeConnectionIds
     : (excludeConnectionIds ? new Set([excludeConnectionIds]) : new Set());
   const preferredConnectionId = options?.preferredConnectionId || null;
+  const affinityContext = options?.affinityContext || (preferredConnectionId ? null : options);
   // Acquire mutex to prevent race conditions
   const currentMutex = selectionMutex;
   let resolveMutex;
@@ -101,60 +135,107 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
     // Per-provider strategy overrides global setting
     const providerOverride = (settings.providerStrategies || {})[providerId] || {};
     const strategy = providerOverride.fallbackStrategy || settings.fallbackStrategy || "fill-first";
+    const affinityKey = buildAffinityKey(affinityContext);
+    const affinityCandidateId = affinityKey ? affinityAssignments.get(affinityKey) || null : null;
 
     let connection;
+    let routingOutcome = affinityKey ? "affinity-miss" : "fallback";
+
     // Pin to preferred connection if specified and available
     if (preferredConnectionId) {
       connection = availableConnections.find((c) => c.id === preferredConnectionId);
       if (connection) {
+        routingOutcome = "preferred";
         log.info("AUTH", `${provider} | pinned to ${connection.id?.slice(0, 8)} (${connection.name || connection.email || "unnamed"})`);
       }
     }
-    if (connection) {
-      // skip strategy
-    } else if (strategy === "round-robin") {
-      const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
-      // Sort by lastUsed (most recent first) to find current candidate
-      const byRecency = [...availableConnections].sort((a, b) => {
-        if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
-        if (!a.lastUsedAt) return 1;
-        if (!b.lastUsedAt) return -1;
-        return new Date(b.lastUsedAt) - new Date(a.lastUsedAt);
-      });
+    if (!connection && affinityKey && affinityCandidateId) {
+      const affinityCandidate = availableConnections.find(c => c.id === affinityCandidateId);
+      if (affinityCandidate) {
+        connection = affinityCandidate;
+        routingOutcome = "affinity-hit";
+      }
+    }
 
-      const current = byRecency[0];
-      const currentCount = current?.consecutiveUseCount || 0;
+    if (strategy === "round-robin") {
+      if (!connection) {
+        if (affinityKey) {
+          const sortedForAffinity = [...availableConnections].sort((a, b) => {
+            if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
+            if (!a.lastUsedAt) return -1;
+            if (!b.lastUsedAt) return 1;
+            return new Date(a.lastUsedAt) - new Date(b.lastUsedAt);
+          });
+          const topCandidates = sortedForAffinity.filter((candidate) => {
+            const top = sortedForAffinity[0];
+            return (candidate.priority || 999) === (top.priority || 999) && candidate.lastUsedAt === top.lastUsedAt;
+          });
+          connection = pickWeakTieBreaker(topCandidates, affinityContext, affinityKey) || sortedForAffinity[0];
+          routingOutcome = "affinity-miss";
+        } else {
+          const stickyLimit = providerOverride.stickyRoundRobinLimit || settings.stickyRoundRobinLimit || 3;
 
-      if (current && current.lastUsedAt && currentCount < stickyLimit) {
-        // Stay with current account
-        connection = current;
-        // Update lastUsedAt and increment count (await to ensure persistence)
-        await updateProviderConnection(connection.id, {
-          lastUsedAt: new Date().toISOString(),
-          consecutiveUseCount: (connection.consecutiveUseCount || 0) + 1
-        });
-      } else {
-        // Pick the least recently used (excluding current if possible)
-        const sortedByOldest = [...availableConnections].sort((a, b) => {
-          if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
-          if (!a.lastUsedAt) return -1;
-          if (!b.lastUsedAt) return 1;
-          return new Date(a.lastUsedAt) - new Date(b.lastUsedAt);
-        });
+          // Sort by lastUsed (most recent first) to find current candidate
+          const byRecency = [...availableConnections].sort((a, b) => {
+            if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
+            if (!a.lastUsedAt) return 1;
+            if (!b.lastUsedAt) return -1;
+            return new Date(b.lastUsedAt) - new Date(a.lastUsedAt);
+          });
 
-        connection = sortedByOldest[0];
+          const current = byRecency[0];
+          const currentCount = current?.consecutiveUseCount || 0;
 
-        // Update lastUsedAt and reset count to 1 (await to ensure persistence)
-        await updateProviderConnection(connection.id, {
-          lastUsedAt: new Date().toISOString(),
-          consecutiveUseCount: 1
-        });
+          if (current && current.lastUsedAt && currentCount < stickyLimit) {
+            // Stay with current account
+            connection = current;
+          } else {
+            // Pick the least recently used (excluding current if possible)
+            const sortedByOldest = [...availableConnections].sort((a, b) => {
+              if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
+              if (!a.lastUsedAt) return -1;
+              if (!b.lastUsedAt) return 1;
+              return new Date(a.lastUsedAt) - new Date(b.lastUsedAt);
+            });
+
+            connection = sortedByOldest[0];
+          }
+
+          await touchSelectedConnection(connection, strategy);
+        }
+      }
+      if (routingOutcome === "affinity-hit") {
+        await touchSelectedConnection(connection, strategy);
       }
     } else {
       // Default: fill-first (already sorted by priority in getProviderConnections)
-      connection = availableConnections[0];
+      if (!connection) {
+        if (affinityKey) {
+          const sortedForAffinity = [...availableConnections].sort((a, b) => {
+            if (!a.lastUsedAt && !b.lastUsedAt) return (a.priority || 999) - (b.priority || 999);
+            if (!a.lastUsedAt) return -1;
+            if (!b.lastUsedAt) return 1;
+            return new Date(a.lastUsedAt) - new Date(b.lastUsedAt);
+          });
+          const topCandidates = sortedForAffinity.filter((candidate) => {
+            const top = sortedForAffinity[0];
+            return (candidate.priority || 999) === (top.priority || 999) && candidate.lastUsedAt === top.lastUsedAt;
+          });
+          connection = pickWeakTieBreaker(topCandidates, affinityContext, affinityKey) || sortedForAffinity[0];
+          routingOutcome = "affinity-miss";
+        } else {
+          connection = availableConnections[0];
+        }
+      }
     }
+
+    if (affinityKey && connection) {
+      affinityAssignments.set(affinityKey, connection.id);
+      routingOutcome = routingOutcome === "affinity-hit" ? "affinity-hit" : "affinity-miss";
+    }
+
+    log.info("AUTH", `${provider} | ${routingOutcome} | account=${connection.connectionName || connection.displayName || connection.name || connection.email || connection.id}`);
 
     const resolvedProxy = await resolveConnectionProxyConfig(connection.providerSpecificData || {});
 
@@ -177,6 +258,8 @@ export async function getProviderCredentials(provider, excludeConnectionIds = nu
       // Include current status for optimization check
       testStatus: connection.testStatus,
       lastError: connection.lastError,
+      routingOutcome,
+      affinityKey,
       // Pass full connection for clearAccountError to read modelLock_* keys
       _connection: connection
     };
