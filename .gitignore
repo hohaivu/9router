@@ -88,3 +88,4 @@ graphify-out/*
 .next-analyze/*
 .gitnexus
 scripts/agSniffer/*
+.gitnexus
