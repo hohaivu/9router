@@ -12,7 +12,13 @@ const log = (msg) => console.log(`[${time()}] [MITM] ${msg}`);
 const err = (msg) => console.error(`[${time()}] ❌ [MITM] ${msg}`);
 
 const DUMP_DIR = path.join(DATA_DIR, "logs", "mitm");
-if (!fs.existsSync(DUMP_DIR)) fs.mkdirSync(DUMP_DIR, { recursive: true });
+if (process.env.NEXT_PHASE !== "phase-production-build") {
+  try {
+    if (!fs.existsSync(DUMP_DIR)) fs.mkdirSync(DUMP_DIR, { recursive: true });
+  } catch (e) {
+    if (e?.code !== "EACCES" && e?.code !== "EPERM" && e?.code !== "ENOENT") throw e;
+  }
+}
 
 // Clear all files inside DUMP_DIR (called on MITM server start to avoid unbounded growth)
 function clearDumpDir() {

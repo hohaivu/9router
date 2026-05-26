@@ -14,12 +14,13 @@ function defaultDir() {
 function getDataDir() {
   const configured = process.env.DATA_DIR;
   if (!configured) return defaultDir();
+  if (process.env.NEXT_PHASE === "phase-production-build") return configured;
   try {
     fs.mkdirSync(configured, { recursive: true });
     return configured;
   } catch (e) {
-    if (e?.code === "EACCES" || e?.code === "EPERM") {
-      console.warn(`[DATA_DIR] '${configured}' not writable → fallback ~/.${APP_NAME}`);
+    if (e?.code === "EACCES" || e?.code === "EPERM" || e?.code === "ENOENT") {
+      console.warn(`[DATA_DIR] '${configured}' not writable (${e.code}) → fallback ~/.${APP_NAME}`);
       return defaultDir();
     }
     throw e;
