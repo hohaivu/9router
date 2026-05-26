@@ -20,10 +20,14 @@ export function getQuotaCooldown(backoffLevel = 0) {
  * @param {number} backoffLevel - Current backoff level for exponential backoff
  * @returns {{ shouldFallback: boolean, cooldownMs: number, newBackoffLevel?: number }}
  */
-export function checkFallbackError(status, errorText, backoffLevel = 0) {
+export function checkFallbackError(status, errorText, backoffLevel = 0, options = {}) {
   const lowerError = errorText
     ? (typeof errorText === "string" ? errorText : JSON.stringify(errorText)).toLowerCase()
     : "";
+
+  if (lowerError.includes("ttft_timeout")) {
+    return { shouldFallback: true, cooldownMs: options?.ttftCooldownMs ?? 15000 };
+  }
 
   for (const rule of ERROR_RULES) {
     // Text-based rule: match substring in error message
