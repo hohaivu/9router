@@ -6,13 +6,6 @@
 
 import fs from "fs";
 import path from "path";
-import {
-  buildResponsesToolItem,
-  getResponsesCustomToolNames,
-  getResponsesToolInputEvent,
-  getResponsesToolItemIdPrefix,
-  getResponsesToolItemType
-} from "../translator/helpers/responsesCustomTools.js";
 
 // Create log directory for responses (Node.js only)
 export function createResponsesLogger(model, logsDir = null) {
@@ -58,7 +51,27 @@ export function createResponsesLogger(model, logsDir = null) {
  * @param {Object} logger - Optional logger instance
  * @returns {TransformStream}
  */
-export function createResponsesApiTransformStream(logger = null, body = null) {
+export function createResponsesApiTransformStream(logger = null, customTools = null) {
+  const customToolSet = customTools instanceof Set
+    ? customTools
+    : (Array.isArray(customTools) ? new Set(customTools) : new Set());
+  const isCustomToolName = (name) => !!(name && customToolSet.has(name));
+
+  const unwrapCustomInput = (rawArgs) => {
+    if (!rawArgs) return "";
+    try {
+      const parsed = JSON.parse(rawArgs);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        if (typeof parsed.input === "string") return parsed.input;
+        if (typeof parsed.patch === "string") return parsed.patch;
+      }
+      if (typeof parsed === "string") return parsed;
+    } catch {
+      // Not JSON — treat as raw text
+    }
+    return rawArgs;
+  };
+
   const state = {
     seq: 0,
     responseId: `resp_${Date.now()}`,
@@ -77,10 +90,8 @@ export function createResponsesApiTransformStream(logger = null, body = null) {
     funcArgsBuf: {},
     funcNames: {},
     funcCallIds: {},
-    funcItemTypes: {},
     funcArgsDone: {},
     funcItemDone: {},
-    customToolNames: getResponsesCustomToolNames(body),
     buffer: "",
     completedSent: false
   };
@@ -204,35 +215,66 @@ export function createResponsesApiTransformStream(logger = null, body = null) {
 
   const closeToolCall = (controller, idx) => {
     const callId = state.funcCallIds[idx];
-    if (callId && !state.funcItemDone[idx]) {
-      const itemType = state.funcItemTypes?.[idx] || getResponsesToolItemType(state.funcNames[idx] || "", state.customToolNames);
-      const itemIdPrefix = getResponsesToolItemIdPrefix(itemType);
-      const doneEvent = getResponsesToolInputEvent(itemType, true);
-      const args = state.funcArgsBuf[idx] || (itemType === "custom_tool_call" ? "" : "{}");
-      
-      emit(controller, doneEvent, {
-        type: doneEvent,
-        item_id: `${itemIdPrefix}_${callId}`,
+    if (!callId || state.funcItemDone[idx]) return;
+
+    const name = state.funcNames[idx] || "";
+    const rawArgs = state.funcArgsBuf[idx] || "{}";
+
+    if (isCustomToolName(name)) {
+      // Codex freeform tools (apply_patch etc.) — emit custom_tool_call shape (#1371)
+      const input = unwrapCustomInput(rawArgs);
+      const itemId = `ctc_${callId}`;
+
+      if (input) {
+        emit(controller, "response.custom_tool_call_input.delta", {
+          type: "response.custom_tool_call_input.delta",
+          item_id: itemId,
+          output_index: parseInt(idx),
+          delta: input
+        });
+      }
+
+      emit(controller, "response.custom_tool_call_input.done", {
+        type: "response.custom_tool_call_input.done",
+        item_id: itemId,
         output_index: parseInt(idx),
-        name: state.funcNames[idx] || "",
-        ...(itemType === "custom_tool_call" ? { input: args } : { arguments: args })
+        input
       });
 
       emit(controller, "response.output_item.done", {
         type: "response.output_item.done",
         output_index: parseInt(idx),
-        item: buildResponsesToolItem({
-          itemType,
-          id: `${itemIdPrefix}_${callId}`,
-          callId,
-          name: state.funcNames[idx] || "",
-          value: args
-        })
+        item: {
+          id: itemId,
+          type: "custom_tool_call",
+          name,
+          call_id: callId,
+          input
+        }
+      });
+    } else {
+      emit(controller, "response.function_call_arguments.done", {
+        type: "response.function_call_arguments.done",
+        item_id: `fc_${callId}`,
+        output_index: parseInt(idx),
+        arguments: rawArgs
       });
 
-      state.funcItemDone[idx] = true;
-      state.funcArgsDone[idx] = true;
+      emit(controller, "response.output_item.done", {
+        type: "response.output_item.done",
+        output_index: parseInt(idx),
+        item: {
+          id: `fc_${callId}`,
+          type: "function_call",
+          arguments: rawArgs,
+          call_id: callId,
+          name
+        }
+      });
     }
+
+    state.funcItemDone[idx] = true;
+    state.funcArgsDone[idx] = true;
   };
 
   const sendCompleted = (controller) => {
@@ -393,45 +435,57 @@ export function createResponsesApiTransformStream(logger = null, body = null) {
             const funcName = tc.function?.name;
 
             if (funcName) state.funcNames[tcIdx] = funcName;
-            const toolName = state.funcNames[tcIdx] || "";
-            // #1371: preserve Codex freeform tools such as apply_patch as
-            // Responses custom_tool_call events instead of JSON function calls.
-            const itemType = getResponsesToolItemType(toolName, state.customToolNames);
-            const itemIdPrefix = getResponsesToolItemIdPrefix(itemType);
+
+            const custom = isCustomToolName(state.funcNames[tcIdx]);
 
             if (!state.funcCallIds[tcIdx] && newCallId) {
               state.funcCallIds[tcIdx] = newCallId;
-              state.funcItemTypes[tcIdx] = itemType;
-              
-              emit(controller, "response.output_item.added", {
-                type: "response.output_item.added",
-                output_index: tcIdx,
-                item: buildResponsesToolItem({
-                  itemType,
-                  id: `${itemIdPrefix}_${newCallId}`,
-                  callId: newCallId,
-                  name: toolName,
-                  value: ""
-                })
-              });
+
+              if (custom) {
+                emit(controller, "response.output_item.added", {
+                  type: "response.output_item.added",
+                  output_index: tcIdx,
+                  item: {
+                    id: `ctc_${newCallId}`,
+                    type: "custom_tool_call",
+                    name: state.funcNames[tcIdx] || "",
+                    call_id: newCallId,
+                    input: ""
+                  }
+                });
+              } else {
+                emit(controller, "response.output_item.added", {
+                  type: "response.output_item.added",
+                  output_index: tcIdx,
+                  item: {
+                    id: `fc_${newCallId}`,
+                    type: "function_call",
+                    arguments: "",
+                    call_id: newCallId,
+                    name: state.funcNames[tcIdx] || ""
+                  }
+                });
+              }
             }
 
             if (!state.funcArgsBuf[tcIdx]) state.funcArgsBuf[tcIdx] = "";
 
             if (tc.function?.arguments) {
-              const refCallId = state.funcCallIds[tcIdx] || newCallId;
-              const refItemType = state.funcItemTypes?.[tcIdx] || itemType;
-              const refItemIdPrefix = getResponsesToolItemIdPrefix(refItemType);
-              const deltaEvent = getResponsesToolInputEvent(refItemType);
-              if (refCallId) {
-                emit(controller, deltaEvent, {
-                  type: deltaEvent,
-                  item_id: `${refItemIdPrefix}_${refCallId}`,
-                  output_index: tcIdx,
-                  delta: tc.function.arguments
-                });
-              }
               state.funcArgsBuf[tcIdx] += tc.function.arguments;
+
+              // For custom (freeform) tools, defer emission to closeToolCall so
+              // we can unwrap the JSON envelope back to a raw `input` string.
+              if (!custom) {
+                const refCallId = state.funcCallIds[tcIdx] || newCallId;
+                if (refCallId) {
+                  emit(controller, "response.function_call_arguments.delta", {
+                    type: "response.function_call_arguments.delta",
+                    item_id: `fc_${refCallId}`,
+                    output_index: tcIdx,
+                    delta: tc.function.arguments
+                  });
+                }
+              }
             }
           }
         }
