@@ -25,6 +25,8 @@ const CODEX_SSE_USER_OUTPUT_PATTERNS = [
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
 const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
 
+const CODEX_DEFAULT_REASONING_EFFORT = "medium";
+
 const configuredInitialResponseTimeoutMs = Number(process.env.CODEX_INITIAL_RESPONSE_TIMEOUT_MS);
 const CODEX_INITIAL_RESPONSE_TIMEOUT_MS = Number.isFinite(configuredInitialResponseTimeoutMs) && configuredInitialResponseTimeoutMs >= 0
   ? configuredInitialResponseTimeoutMs
@@ -489,7 +491,12 @@ export class CodexExecutor extends BaseExecutor {
 
     // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (medium)
     if (!body.reasoning) {
-      const effort = normalizeReasoningEffort(body.model, body.reasoning_effort || modelEffort || 'low');
+      // Claude Code does not always send reasoning_effort, so keep Codex
+      // requests at the documented medium default unless configured.
+      const effort = normalizeReasoningEffort(
+        body.model,
+        body.reasoning_effort || modelEffort || CODEX_DEFAULT_REASONING_EFFORT,
+      );
       body.reasoning = { effort, summary: "auto" };
     } else {
       body.reasoning.effort = normalizeReasoningEffort(body.model, body.reasoning.effort);
