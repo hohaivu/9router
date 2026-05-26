@@ -34,7 +34,7 @@ import { prefetchRemoteImages } from "../translator/concerns/prefetch.js";
  * @param {object} options.credentials - Provider credentials
  * @param {string} options.sourceFormatOverride - Override detected source format (e.g. "openai-responses")
  */
-export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking }) {
+export async function handleChatCore({ body, modelInfo, credentials, log, onCredentialsRefreshed, onRequestSuccess, onDisconnect, clientRawRequest, connectionId, userAgent, apiKey, ccFilterNaming, rtkEnabled, headroomEnabled, headroomUrl, headroomCompressUserMessages, cavemanEnabled, cavemanLevel, ponytailEnabled, ponytailLevel, sourceFormatOverride, providerThinking, ttftTimeoutMs = 0, ttftCooldownMs = 15000 }) {
   const { provider, model } = modelInfo;
   const requestStartTime = Date.now();
 
@@ -244,25 +244,30 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     finalBody = result.transformedBody;
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
   } catch (error) {
+    const isClientAbort = error.name === "AbortError";
+    const errorStatus = error.status === HTTP_STATUS.GATEWAY_TIMEOUT
+      ? HTTP_STATUS.GATEWAY_TIMEOUT
+      : (isClientAbort ? 499 : HTTP_STATUS.BAD_GATEWAY);
+
     trackPendingRequest(model, provider, connectionId, false, true);
-    appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });
+    appendRequestLog({ model, provider, connectionId, status: `FAILED ${errorStatus}` }).catch(() => { });
     saveRequestDetail(buildRequestDetail({
       provider, model, connectionId,
       latency: { ttft: 0, total: Date.now() - requestStartTime },
       tokens: { prompt_tokens: 0, completion_tokens: 0 },
       request: extractRequestConfig(body, stream),
       providerRequest: translatedBody || null,
-      response: { error: error.message || String(error), status: error.name === "AbortError" ? 499 : 502, thinking: null },
+      response: { error: error.message || String(error), status: errorStatus, thinking: null },
       status: "error"
     })).catch(() => { });
 
-    if (error.name === "AbortError") {
+    if (isClientAbort) {
       streamController.handleError(error);
       return createErrorResult(499, "Request aborted");
     }
-    const errMsg = formatProviderError(error, provider, model, HTTP_STATUS.BAD_GATEWAY);
+    const errMsg = formatProviderError(error, provider, model, errorStatus);
     console.log(`${COLORS.red}[ERROR] ${errMsg}${COLORS.reset}`);
-    return createErrorResult(HTTP_STATUS.BAD_GATEWAY, errMsg);
+    return createErrorResult(errorStatus, errMsg);
   }
 
   // Handle 401/403 - try token refresh (skip for noAuth providers)
@@ -326,8 +331,89 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
   }
 
   // Streaming response
-  const { onStreamComplete } = buildOnStreamComplete({ ...sharedCtx });
-  return handleStreamingResponse({ ...sharedCtx, providerResponse, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete });
+  const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  const { onStreamComplete } = buildOnStreamComplete({ ...sharedCtx, streamDetailId });
+
+  // TTFT deadline race: if enabled, measure from full request start → first token
+  let responseToStream = providerResponse;
+  if (stream && ttftTimeoutMs > 0) {
+    const elapsedBeforeStreamMs = Date.now() - requestStartTime;
+    const remainingTtftMs = ttftTimeoutMs - elapsedBeforeStreamMs;
+
+    if (remainingTtftMs <= 0) {
+      streamController.abort();
+      trackPendingRequest(model, provider, connectionId, false, true);
+      appendRequestLog({ model, provider, connectionId, status: "TTFT_TIMEOUT" }).catch(() => {});
+      saveRequestDetail(buildRequestDetail({
+        provider, model, connectionId,
+        latency: { ttft: Date.now() - requestStartTime, total: Date.now() - requestStartTime },
+        tokens: { prompt_tokens: 0, completion_tokens: 0 },
+        request: extractRequestConfig(body, stream),
+        providerRequest: finalBody || translatedBody || null,
+        response: { error: "ttft_timeout", message: "Timed out before first token; fell back to the next account.", thinking: null },
+        status: "error"
+      }, { id: streamDetailId })).catch(() => {});
+      console.log(`[TTFT] ${provider}/${model} exceeded ${ttftTimeoutMs}ms before first token`);
+      return createErrorResult(408, "ttft_timeout");
+    }
+
+    const ttftResult = await raceTtftDeadline(providerResponse, remainingTtftMs, streamController);
+    if (ttftResult.timedOut) {
+      trackPendingRequest(model, provider, connectionId, false, true);
+      appendRequestLog({ model, provider, connectionId, status: "TTFT_TIMEOUT" }).catch(() => {});
+      saveRequestDetail(buildRequestDetail({
+        provider, model, connectionId,
+        latency: { ttft: Date.now() - requestStartTime, total: Date.now() - requestStartTime },
+        tokens: { prompt_tokens: 0, completion_tokens: 0 },
+        request: extractRequestConfig(body, stream),
+        providerRequest: finalBody || translatedBody || null,
+        response: { error: "ttft_timeout", message: "Timed out before first token; fell back to the next account.", thinking: null },
+        status: "error"
+      }, { id: streamDetailId })).catch(() => {});
+      console.log(`[TTFT] ${provider}/${model} exceeded ${ttftTimeoutMs}ms before first token`);
+      return createErrorResult(408, "ttft_timeout");
+    }
+    responseToStream = ttftResult.response;
+  }
+
+  return handleStreamingResponse({ ...sharedCtx, providerResponse: responseToStream, sourceFormat, targetFormat, userAgent, reqLogger, toolNameMap, streamController, onStreamComplete, streamDetailId });
+}
+
+async function raceTtftDeadline(providerResponse, ttftTimeoutMs, streamController) {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      streamController.abort();
+      resolve({ timedOut: true });
+    }, ttftTimeoutMs);
+
+    const reader = providerResponse.body.getReader();
+    reader.read().then(({ value, done }) => {
+      clearTimeout(timer);
+      const newBody = new ReadableStream({
+        start(controller) {
+          if (!done && value) controller.enqueue(value);
+          if (done) { controller.close(); return; }
+        },
+        async pull(controller) {
+          const { value: chunk, done: isDone } = await reader.read();
+          if (isDone) { controller.close(); return; }
+          controller.enqueue(chunk);
+        },
+        cancel() { reader.cancel(); }
+      });
+      resolve({
+        timedOut: false,
+        response: new Response(newBody, {
+          status: providerResponse.status,
+          statusText: providerResponse.statusText,
+          headers: providerResponse.headers
+        })
+      });
+    }).catch(() => {
+      clearTimeout(timer);
+      resolve({ timedOut: true });
+    });
+  });
 }
 
 export function isTokenExpiringSoon(expiresAt, bufferMs = 5 * 60 * 1000) {

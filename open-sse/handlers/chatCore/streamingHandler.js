@@ -43,13 +43,26 @@ function buildTransformStream({ provider, sourceFormat, targetFormat, userAgent,
 /**
  * Handle streaming response — pipe provider SSE through transform stream to client.
  */
-export function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete }) {
+export function handleStreamingResponse({ providerResponse, provider, model, sourceFormat, targetFormat, userAgent, body, stream, translatedBody, finalBody, requestStartTime, connectionId, apiKey, clientRawRequest, onRequestSuccess, reqLogger, toolNameMap, streamController, onStreamComplete, streamDetailId }) {
+  let responseToStream = providerResponse;
   if (onRequestSuccess) {
-    Promise.resolve()
-      .then(onRequestSuccess)
-      .catch(err => {
-        console.error("[ChatCore] onRequestSuccess failed:", err?.message || err);
-      });
+    let firstChunkFired = false;
+    const original = providerResponse.body;
+    const wrapped = new TransformStream({
+      transform(chunk, controller) {
+        if (!firstChunkFired) {
+          firstChunkFired = true;
+          onRequestSuccess();
+        }
+        controller.enqueue(chunk);
+      }
+    });
+    original.pipeTo(wrapped.writable).catch(() => {});
+    responseToStream = new Response(wrapped.readable, {
+      status: providerResponse.status,
+      statusText: providerResponse.statusText,
+      headers: providerResponse.headers
+    });
   }
 
   // Warn when upstream returns unexpected Content-Type for a streaming response.
@@ -68,7 +81,6 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
   const stallTimeoutMs = PROVIDERS[provider]?.stallTimeoutMs || STREAM_STALL_TIMEOUT_MS;
   const transformedBody = pipeWithDisconnect(providerResponse, transformStream, streamController, onAbortTerminal, stallTimeoutMs);
 
-  const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
   saveRequestDetail(buildRequestDetail({
     provider, model, connectionId,
     latency: { ttft: 0, total: Date.now() - requestStartTime },
@@ -91,8 +103,7 @@ export function handleStreamingResponse({ providerResponse, provider, model, sou
 /**
  * Build onStreamComplete callback for streaming usage tracking.
  */
-export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest }) {
-  const streamDetailId = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+export function buildOnStreamComplete({ provider, model, connectionId, apiKey, requestStartTime, body, stream, finalBody, translatedBody, clientRawRequest, streamDetailId }) {
 
   const onStreamComplete = (contentObj, usage, ttftAt) => {
     const latency = {

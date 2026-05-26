@@ -16,6 +16,12 @@ import { resolveSessionId } from "../utils/sessionManager.js";
 const CODEX_SSE_OVERLOADED_PATTERNS = ["server_is_overloaded", "service_unavailable_error"];
 const CODEX_SSE_PEEK_BYTES = 4096;
 
+const configuredInitialResponseTimeoutMs = Number(process.env.CODEX_INITIAL_RESPONSE_TIMEOUT_MS);
+const CODEX_INITIAL_RESPONSE_TIMEOUT_MS = Number.isFinite(configuredInitialResponseTimeoutMs) && configuredInitialResponseTimeoutMs >= 0
+  ? configuredInitialResponseTimeoutMs
+  : 7 * 1000;
+
+
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
 
@@ -197,7 +203,7 @@ export class CodexExecutor extends BaseExecutor {
     const { attempts, delayMs } = resolveRetryEntry(retryConfig[503]);
     let attempt = 0;
     while (true) {
-      const result = await super.execute(args);
+      const result = await this._executeWithInitialTimeout(args);
       const peek = await this._peekSseOverloaded(result.response);
       if (!peek.matched) {
         // Replace body with re-assembled stream (prefix bytes already read + rest)
@@ -227,6 +233,44 @@ export class CodexExecutor extends BaseExecutor {
       dbg("CODEX", `SSE overloaded "${peek.matched}" → retry ${attempt}/${attempts} in ${delayMs}ms`);
       try { await result.response.body?.cancel?.(); } catch { /* noop */ }
       await new Promise(r => setTimeout(r, delayMs));
+    }
+  }
+
+  // Wrap super.execute with a TTFT (time-to-first-token) timeout. Aborts upstream if no
+  // initial response within CODEX_INITIAL_RESPONSE_TIMEOUT_MS; 0 disables the timeout.
+  async _executeWithInitialTimeout(args) {
+    if (CODEX_INITIAL_RESPONSE_TIMEOUT_MS === 0) {
+      return super.execute(args);
+    }
+
+    const upstreamController = new AbortController();
+    let initialResponseTimedOut = false;
+    const abortFromClient = () => upstreamController.abort(args.signal?.reason);
+
+    if (args.signal?.aborted) {
+      abortFromClient();
+    } else {
+      args.signal?.addEventListener("abort", abortFromClient, { once: true });
+    }
+
+    const timeout = setTimeout(() => {
+      initialResponseTimedOut = true;
+      upstreamController.abort();
+    }, CODEX_INITIAL_RESPONSE_TIMEOUT_MS);
+
+    try {
+      return await super.execute({ ...args, signal: upstreamController.signal });
+    } catch (error) {
+      if (initialResponseTimedOut) {
+        const timeoutError = new Error(`Codex initial response timeout after ${CODEX_INITIAL_RESPONSE_TIMEOUT_MS}ms`);
+        timeoutError.name = "UpstreamResponseTimeoutError";
+        timeoutError.status = 504;
+        throw timeoutError;
+      }
+      throw error;
+    } finally {
+      clearTimeout(timeout);
+      args.signal?.removeEventListener("abort", abortFromClient);
     }
   }
 
