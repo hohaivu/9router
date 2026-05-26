@@ -8,6 +8,7 @@ import path from "path";
 import os from "os";
 import { parseTOML, stringifyTOML } from "confbox";
 import { migrateCodexFeatureFlags } from "@/shared/utils/codexConfig";
+import { buildCodexSubagentRole } from "./config.js";
 
 const execAsync = promisify(exec);
 
@@ -145,9 +146,7 @@ export async function POST(request) {
 
     // Add subagent configuration
     const effectiveSubagentModel = subagentModel || model;
-    setNestedSection(parsed, "agents.subagent", {
-      model: effectiveSubagentModel,
-    });
+    setNestedSection(parsed, "agents.subagent", buildCodexSubagentRole(effectiveSubagentModel));
 
     // Write merged config
     const configContent = stringifyTOML(parsed);

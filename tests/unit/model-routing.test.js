@@ -3,6 +3,9 @@ import os from "node:os";
 import path from "node:path";
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 
+import { getProviderModels, getModelQuotaFamily } from "../../open-sse/config/providerModels.js";
+import { getModelInfoCore } from "../../open-sse/services/model.js";
+
 const originalDataDir = process.env.DATA_DIR;
 
 async function setupDb() {
@@ -76,5 +79,23 @@ describe("model routing", () => {
         provider: "openai-compatible-chat-test",
         model: "gpt-image-1",
       });
+  });
+
+  it("routes bare Codex auto-review model to Codex OAuth (#1398)", async () => {
+    const modelInfo = await getModelInfoCore("codex-auto-review", {});
+
+    expect(modelInfo).toEqual({
+      provider: "codex",
+      model: "codex-auto-review",
+    });
+  });
+
+  it("exposes Codex auto-review as a review-quota Codex model", () => {
+    const models = getProviderModels("cx");
+    const autoReview = models.find((model) => model.id === "codex-auto-review");
+
+    expect(autoReview).toBeTruthy();
+    expect(autoReview.name).toBe("Codex Auto Review");
+    expect(getModelQuotaFamily("cx", "codex-auto-review")).toBe("review");
   });
 });
