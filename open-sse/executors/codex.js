@@ -16,6 +16,8 @@ import { resolveSessionId } from "../utils/sessionManager.js";
 const CODEX_SSE_OVERLOADED_PATTERNS = ["server_is_overloaded", "service_unavailable_error"];
 const CODEX_SSE_PEEK_BYTES = 4096;
 
+const CODEX_DEFAULT_REASONING_EFFORT = "medium";
+
 const configuredInitialResponseTimeoutMs = Number(process.env.CODEX_INITIAL_RESPONSE_TIMEOUT_MS);
 const CODEX_INITIAL_RESPONSE_TIMEOUT_MS = Number.isFinite(configuredInitialResponseTimeoutMs) && configuredInitialResponseTimeoutMs >= 0
   ? configuredInitialResponseTimeoutMs
@@ -404,7 +406,9 @@ export class CodexExecutor extends BaseExecutor {
 
     // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (medium)
     if (!body.reasoning) {
-      const effort = body.reasoning_effort || modelEffort || 'low';
+      // #1417: Claude Code does not always send reasoning_effort, so keep
+      // Codex requests at the documented medium default unless configured.
+      const effort = body.reasoning_effort || modelEffort || CODEX_DEFAULT_REASONING_EFFORT;
       body.reasoning = { effort, summary: "auto" };
     } else if (!body.reasoning.summary) {
       body.reasoning.summary = "auto";

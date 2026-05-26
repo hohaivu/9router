@@ -200,6 +200,7 @@
 ## Fixes
 - GitHub Copilot: never route Gemini/Claude models to the `/responses` endpoint; prevents misleading "does not support Responses API" 400s (#1062)
 - proxyFetch: restore missing `Readable` import causing runtime `ReferenceError` in DNS-bypass fetch path
+- Codex: default missing reasoning effort to medium and expose GPT 5.5 effort variants for Claude Code CLI configs (#1417)
 
 ## Improvements
 - Lower stream stall timeout from 60s → 35s for faster hang detection
