@@ -210,7 +210,7 @@
 ## Fixes
 - Codex: auto-retry when upstream drops mid-stream (no more hangs)
 - Codex: fix random 400/404 errors, tool-calling failures, and unstable prompt cache
-- MITM: support Antigravity 2.x 
+- MITM: support Antigravity 2.x (updated IDE version detection and DNS/cert flow)
 - Sanitize Read tool args to prevent retry loops from non-Anthropic models (#1144)
 - Implement json_schema fallback for OpenAI-compatible providers without native Structured Output (#1343)
 - Strip empty Read pages argument in OpenAI-to-Claude translator (#1354)
