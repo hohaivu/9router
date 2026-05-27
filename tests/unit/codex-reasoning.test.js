@@ -42,9 +42,27 @@ describe("CodexExecutor reasoning effort", () => {
     expect(body.include).toBeUndefined();
   });
 
+  it("routes GPT 5.5 fast aliases as the base model with priority service tier", () => {
+    const body = transformCodex("gpt-5.5-fast", { service_tier: "default" });
+
+    expect(body.model).toBe("gpt-5.5");
+    expect(body.service_tier).toBe("priority");
+    expect(body.reasoning).toEqual({ effort: "medium", summary: "auto" });
+  });
+
+  it("routes GPT 5.4 mini fast aliases without treating mini as reasoning effort", () => {
+    const body = transformCodex("gpt-5.4-mini-fast");
+
+    expect(body.model).toBe("gpt-5.4-mini");
+    expect(body.service_tier).toBe("priority");
+    expect(body.reasoning).toEqual({ effort: "medium", summary: "auto" });
+  });
+
   it("lists GPT 5.5 effort variants for clients that configure by model id", () => {
     const modelIds = PROVIDER_MODELS.cx.map((model) => model.id);
 
+    expect(modelIds).toContain("gpt-5.5-fast");
+    expect(modelIds).toContain("gpt-5.4-mini-fast");
     expect(modelIds).toContain("gpt-5.5-xhigh");
     expect(modelIds).toContain("gpt-5.5-high");
     expect(modelIds).toContain("gpt-5.5-medium");

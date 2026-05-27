@@ -476,6 +476,11 @@ export class CodexExecutor extends BaseExecutor {
     // Map virtual Codex review models to the upstream Codex model before suffix parsing.
     body.model = getModelUpstreamId("cx", body.model || model);
 
+    if (body.model.endsWith("-fast")) {
+      body.model = body.model.slice(0, -"-fast".length);
+      body.service_tier = "priority";
+    }
+
     // Extract thinking level from model name suffix
     // e.g., gpt-5.3-codex-high → high, gpt-5.3-codex → medium (default)
     const effortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
