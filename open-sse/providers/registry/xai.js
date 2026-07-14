@@ -44,4 +44,8 @@ export default {
     endpoint: "https://api.x.ai/v1/responses",
     pricingUrl: "https://x.ai/api#pricing",
   },
+  features: {
+    usage: true,
+    usageApikey: true,
+  },
 };

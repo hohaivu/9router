@@ -6,7 +6,14 @@ import Card from "@/shared/components/Card";
 import Badge from "@/shared/components/Badge";
 
 const fmt = (n) => new Intl.NumberFormat().format(n || 0);
-const fmtCost = (n) => `$${(n || 0).toFixed(2)}`;
+const fmtCost = (n) => {
+  const value = Number(n || 0);
+  if (!Number.isFinite(value) || value === 0) return "$0.00";
+  const abs = Math.abs(value);
+  if (abs < 0.0001) return `$${value.toFixed(6)}`;
+  if (abs < 0.01) return `$${value.toFixed(4)}`;
+  return `$${value.toFixed(2)}`;
+};
 
 function fmtTime(iso) {
   if (!iso) return "Never";
@@ -29,17 +36,20 @@ SortIcon.propTypes = {
 };
 
 /**
- * Render 3 token or cost cells based on viewMode
+ * Render token or cost cells based on viewMode.
  */
 function ValueCells({ item, viewMode, isSummary = false }) {
   if (viewMode === "tokens") {
     return (
       <>
         <td className="px-6 py-3 text-right text-text-muted">
-          {isSummary && item.promptTokens === undefined ? "—" : fmt(item.promptTokens)}
+          {isSummary && item.uncachedInputTokens === undefined ? "—" : fmt(item.uncachedInputTokens)}
         </td>
         <td className="px-6 py-3 text-right text-text-muted">
           {item.cachedTokens ? fmt(item.cachedTokens) : "—"}
+        </td>
+        <td className="px-6 py-3 text-right text-text-muted">
+          {item.cacheCreationTokens ? fmt(item.cacheCreationTokens) : "—"}
         </td>
         <td className="px-6 py-3 text-right text-text-muted">
           {isSummary && item.completionTokens === undefined ? "—" : fmt(item.completionTokens)}
@@ -53,16 +63,19 @@ function ValueCells({ item, viewMode, isSummary = false }) {
   return (
     <>
       <td className="px-6 py-3 text-right text-text-muted">
-        {isSummary && item.inputCost === undefined ? "—" : fmtCost(item.inputCost)}
+        {item.hasCompleteCostBreakdown ? fmtCost(item.inputCost) : "—"}
       </td>
       <td className="px-6 py-3 text-right text-text-muted">
-        {item.cachedCost ? fmtCost(item.cachedCost) : "—"}
+        {item.hasCompleteCostBreakdown ? fmtCost(item.cachedCost) : "—"}
       </td>
       <td className="px-6 py-3 text-right text-text-muted">
-        {isSummary && item.outputCost === undefined ? "—" : fmtCost(item.outputCost)}
+        {item.hasCompleteCostBreakdown ? fmtCost(item.cacheCreationCost) : "—"}
+      </td>
+      <td className="px-6 py-3 text-right text-text-muted">
+        {item.hasCompleteCostBreakdown ? fmtCost(item.outputCost) : "—"}
       </td>
       <td className="px-6 py-3 text-right font-medium text-warning">
-        {fmtCost(item.totalCost || item.cost)}
+        {fmtCost(item.totalCost ?? item.cost)}
       </td>
     </>
   );
@@ -138,16 +151,18 @@ export default function UsageTable({
   const valueColumns = useMemo(() => {
     if (viewMode === "tokens") {
       return [
-        { field: "promptTokens", label: "Input Tokens" },
-        { field: "cachedTokens", label: "Cached" },
+        { field: "uncachedInputTokens", label: "Uncached Input" },
+        { field: "cachedTokens", label: "Cache Read" },
+        { field: "cacheCreationTokens", label: "Cache Write" },
         { field: "completionTokens", label: "Output Tokens" },
         { field: "totalTokens", label: "Total Tokens" },
       ];
     }
     return [
-      { field: "promptTokens", label: "Input Cost" },
-      { field: "cachedCost", label: "Cached Cost" },
-      { field: "completionTokens", label: "Output Cost" },
+      { field: "inputCost", label: "Uncached Input Cost" },
+      { field: "cachedCost", label: "Cache Read Cost" },
+      { field: "cacheCreationCost", label: "Cache Write Cost" },
+      { field: "outputCost", label: "Output Cost" },
       { field: "cost", label: "Total Cost" },
     ];
   }, [viewMode]);

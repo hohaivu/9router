@@ -509,8 +509,25 @@ export function openaiResponsesToOpenAIResponse(chunk, state) {
       // OpenAI Responses API: input_tokens already includes cached_tokens
       // Cache info is in input_tokens_details.cached_tokens
       const cacheReadTokens = responseUsage.input_tokens_details?.cached_tokens || responseUsage.cache_read_input_tokens || 0;
-      
-      state.usage = buildUsage({ promptTokens: inputTokens, completionTokens: outputTokens, totalTokens: inputTokens + outputTokens, cachedTokens: cacheReadTokens });
+      const cacheWriteTokens = responseUsage.input_tokens_details?.cache_write_tokens ??
+        responseUsage.input_tokens_details?.cache_creation_tokens ??
+        responseUsage.cache_creation_input_tokens ??
+        0;
+      const reasoningTokens = responseUsage.output_tokens_details?.reasoning_tokens || 0;
+
+      state.usage = buildUsage({
+        promptTokens: inputTokens,
+        completionTokens: outputTokens,
+        totalTokens: responseUsage.total_tokens || inputTokens + outputTokens,
+        cachedTokens: cacheReadTokens,
+        cacheCreationTokens: cacheWriteTokens,
+        reasoningTokens,
+      });
+      const serviceTier = data.response?.service_tier || responseUsage.service_tier;
+      if (serviceTier) state.usage.service_tier = serviceTier;
+      for (const field of ["cost_usd", "cost_in_usd", "cost_in_usd_ticks"]) {
+        if (responseUsage[field] !== undefined) state.usage[field] = responseUsage[field];
+      }
     }
     
     if (!state.finishReasonSent) {

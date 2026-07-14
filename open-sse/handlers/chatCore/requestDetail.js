@@ -10,7 +10,7 @@ const OPTIONAL_PARAMS = [
   "seed", "stop", "tools", "tool_choice",
   "response_format", "prediction", "store", "metadata",
   "n", "logprobs", "top_logprobs", "logit_bias",
-  "user", "parallel_tool_calls"
+  "user", "parallel_tool_calls", "service_tier"
 ];
 
 export function extractRequestConfig(body, stream) {
@@ -24,13 +24,24 @@ export function extractRequestConfig(body, stream) {
 export function extractUsageFromResponse(responseBody) {
   if (!responseBody || typeof responseBody !== "object") return null;
 
-  // Claude format
+  // Responses/Claude token shape
   if (responseBody.usage?.input_tokens !== undefined) {
     return {
       prompt_tokens: responseBody.usage.input_tokens || 0,
       completion_tokens: responseBody.usage.output_tokens || 0,
+      total_tokens: responseBody.usage.total_tokens,
+      cached_tokens: responseBody.usage.input_tokens_details?.cached_tokens,
+      reasoning_tokens: responseBody.usage.output_tokens_details?.reasoning_tokens,
       cache_read_input_tokens: responseBody.usage.cache_read_input_tokens,
-      cache_creation_input_tokens: responseBody.usage.cache_creation_input_tokens
+      cache_creation_input_tokens: responseBody.usage.input_tokens_details?.cache_write_tokens ??
+        responseBody.usage.input_tokens_details?.cache_creation_tokens ??
+        responseBody.usage.cache_creation_input_tokens,
+      input_tokens_details: responseBody.usage.input_tokens_details,
+      output_tokens_details: responseBody.usage.output_tokens_details,
+      service_tier: responseBody.service_tier || responseBody.usage.service_tier,
+      cost_usd: responseBody.usage.cost_usd,
+      cost_in_usd: responseBody.usage.cost_in_usd,
+      cost_in_usd_ticks: responseBody.usage.cost_in_usd_ticks
     };
   }
 
@@ -40,17 +51,24 @@ export function extractUsageFromResponse(responseBody) {
       prompt_tokens: responseBody.usage.prompt_tokens || 0,
       completion_tokens: responseBody.usage.completion_tokens || 0,
       cached_tokens: responseBody.usage.prompt_tokens_details?.cached_tokens,
-      reasoning_tokens: responseBody.usage.completion_tokens_details?.reasoning_tokens
+      cache_creation_input_tokens: responseBody.usage.prompt_tokens_details?.cache_write_tokens ??
+        responseBody.usage.prompt_tokens_details?.cache_creation_tokens,
+      reasoning_tokens: responseBody.usage.completion_tokens_details?.reasoning_tokens,
+      service_tier: responseBody.service_tier || responseBody.usage.service_tier,
+      cost_usd: responseBody.usage.cost_usd,
+      cost_in_usd: responseBody.usage.cost_in_usd,
+      cost_in_usd_ticks: responseBody.usage.cost_in_usd_ticks
     };
   }
 
   // Gemini format
   if (responseBody.usageMetadata) {
+    const reasoningTokens = responseBody.usageMetadata.thoughtsTokenCount || 0;
     return {
       prompt_tokens: responseBody.usageMetadata.promptTokenCount || 0,
-      completion_tokens: responseBody.usageMetadata.candidatesTokenCount || 0,
+      completion_tokens: (responseBody.usageMetadata.candidatesTokenCount || 0) + reasoningTokens,
       cached_tokens: responseBody.usageMetadata.cachedContentTokenCount || 0,
-      reasoning_tokens: responseBody.usageMetadata.thoughtsTokenCount || 0
+      reasoning_tokens: reasoningTokens
     };
   }
 
@@ -93,7 +111,7 @@ export function formatDoneLine({ usage, latency }) {
   return `DONE ${latency?.total ?? 0}ms${ttftStr} · ${inStr} · OUT ${outTok}`;
 }
 
-export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, label = "USAGE", silent = false }) {
+export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, endpoint, serviceTier, label = "USAGE", silent = false }) {
   if (!tokens || typeof tokens !== "object") return;
 
   const inTokens = tokens.input_tokens ?? tokens.prompt_tokens ?? 0;
@@ -109,7 +127,23 @@ export function saveUsageStats({ provider, model, tokens, connectionId, apiKey, 
 
   // Canonicalize to one storage convention (prompt_tokens cache-inclusive) so
   // cached/cache-creation tokens survive to cost calc + stats. See canonicalizeUsage.
-  const normalized = canonicalizeUsage(tokens) || {
+  const normalized = canonicalizeUsage({
+    prompt_tokens: tokens.prompt_tokens ?? tokens.input_tokens ?? 0,
+    completion_tokens: tokens.completion_tokens ?? tokens.output_tokens ?? 0,
+    ...(tokens.total_tokens !== undefined ? { total_tokens: tokens.total_tokens } : {}),
+    ...(tokens.cached_tokens !== undefined ? { cached_tokens: tokens.cached_tokens } : {}),
+    ...(tokens.cache_read_input_tokens !== undefined ? { cache_read_input_tokens: tokens.cache_read_input_tokens } : {}),
+    ...(tokens.cache_creation_input_tokens !== undefined ? { cache_creation_input_tokens: tokens.cache_creation_input_tokens } : {}),
+    ...(tokens.input_tokens_details !== undefined ? { input_tokens_details: tokens.input_tokens_details } : {}),
+    ...(tokens.output_tokens_details !== undefined ? { output_tokens_details: tokens.output_tokens_details } : {}),
+    ...(tokens.prompt_tokens_details !== undefined ? { prompt_tokens_details: tokens.prompt_tokens_details } : {}),
+    ...(tokens.completion_tokens_details !== undefined ? { completion_tokens_details: tokens.completion_tokens_details } : {}),
+    ...(tokens.reasoning_tokens !== undefined ? { reasoning_tokens: tokens.reasoning_tokens } : {}),
+    ...(tokens.service_tier || serviceTier ? { service_tier: tokens.service_tier || serviceTier } : {}),
+    ...(tokens.cost_usd !== undefined ? { cost_usd: tokens.cost_usd } : {}),
+    ...(tokens.cost_in_usd !== undefined ? { cost_in_usd: tokens.cost_in_usd } : {}),
+    ...(tokens.cost_in_usd_ticks !== undefined ? { cost_in_usd_ticks: tokens.cost_in_usd_ticks } : {})
+  }) || {
     prompt_tokens: tokens.prompt_tokens ?? tokens.input_tokens ?? 0,
     completion_tokens: tokens.completion_tokens ?? tokens.output_tokens ?? 0
   };

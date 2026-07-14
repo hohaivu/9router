@@ -75,24 +75,24 @@ export function filterUsageForFormat(usage, targetFormat) {
     [FORMATS.CLAUDE]: [
       'input_tokens', 'output_tokens', 
       'cache_read_input_tokens', 'cache_creation_input_tokens',
-      'estimated'
+      'estimated', 'cost_usd', 'cost_in_usd', 'cost_in_usd_ticks'
     ],
     [FORMATS.GEMINI]: [
       'promptTokenCount', 'candidatesTokenCount', 'totalTokenCount',
       'cachedContentTokenCount', 'thoughtsTokenCount',
-      'estimated'
+      'estimated', 'cost_usd', 'cost_in_usd', 'cost_in_usd_ticks'
     ],
     [FORMATS.OPENAI_RESPONSES]: [
       'input_tokens', 'output_tokens',
       'input_tokens_details', 'output_tokens_details',
-      'estimated'
+      'estimated', 'cost_usd', 'cost_in_usd', 'cost_in_usd_ticks'
     ],
     // OpenAI format (default for OPENAI, CODEX, KIRO, etc.)
     default: [
       'prompt_tokens', 'completion_tokens', 'total_tokens',
       'cached_tokens', 'reasoning_tokens',
       'prompt_tokens_details', 'completion_tokens_details',
-      'estimated'
+      'estimated', 'cost_usd', 'cost_in_usd', 'cost_in_usd_ticks'
     ]
   };
 
@@ -131,8 +131,21 @@ export function normalizeUsage(usage) {
   assignNumber("cache_creation_input_tokens", usage?.cache_creation_input_tokens);
   assignNumber("cached_tokens", usage?.cached_tokens);
   assignNumber("reasoning_tokens", usage?.reasoning_tokens);
+  assignNumber("cost_usd", usage?.cost_usd);
+  assignNumber("cost_in_usd", usage?.cost_in_usd);
+  assignNumber("cost_in_usd_ticks", usage?.cost_in_usd_ticks);
+
+  if (typeof usage?.service_tier === "string" && usage.service_tier) {
+    normalized.service_tier = usage.service_tier;
+  }
 
   // Preserve nested details objects for OpenAI format forwarding
+  if (usage?.input_tokens_details && typeof usage.input_tokens_details === "object") {
+    normalized.input_tokens_details = usage.input_tokens_details;
+  }
+  if (usage?.output_tokens_details && typeof usage.output_tokens_details === "object") {
+    normalized.output_tokens_details = usage.output_tokens_details;
+  }
   if (usage?.prompt_tokens_details && typeof usage.prompt_tokens_details === "object") {
     normalized.prompt_tokens_details = usage.prompt_tokens_details;
   }
@@ -145,64 +158,57 @@ export function normalizeUsage(usage) {
 }
 
 /**
- * Canonicalize usage into ONE storage/cost convention so token counts and cost
- * are consistent across providers:
- *   prompt_tokens               = total input INCLUDING cache read + cache creation
- *   cached_tokens               = cache-read portion (subset of prompt_tokens)
- *   cache_creation_input_tokens = cache-write portion (subset of prompt_tokens)
- *   completion_tokens, reasoning_tokens, total_tokens
- *
- * Discriminator: Claude reports cache_read_input_tokens with a prompt that
- * EXCLUDES cache, so we fold cache into prompt. OpenAI/Gemini report
- * cached_tokens already counted inside prompt, so we pass through. Idempotent:
- * once folded the output carries cached_tokens (not cache_read_input_tokens),
- * so re-running takes the passthrough branch and does not double-add.
- *
- * @param {object} usage - a normalizeUsage()-shaped object
- * @returns {object|null} canonical token object, or null for invalid input
+ * Canonical storage convention:
+ * prompt_tokens includes cache reads and writes; cached/write fields are subsets.
  */
 export function canonicalizeUsage(usage) {
   if (!usage || typeof usage !== "object" || Array.isArray(usage)) return null;
 
-  const num = (v) => (Number.isFinite(Number(v)) ? Number(v) : 0);
+  const num = (value) => (Number.isFinite(Number(value)) ? Number(value) : 0);
   const completion = num(usage.completion_tokens ?? usage.output_tokens);
-  const reasoning = num(usage.reasoning_tokens);
-  // Fall back to the nested prompt_tokens_details.cache_creation_tokens shape
-  // (buildUsage()'s OpenAI-forwarding format) when the top-level field is
-  // absent, so callers that pass a buildUsage() object through don't silently
-  // drop cache_creation.
-  const cacheCreation = num(usage.cache_creation_input_tokens ?? usage.prompt_tokens_details?.cache_creation_tokens);
+  const reasoning = num(
+    usage.reasoning_tokens ??
+    usage.output_tokens_details?.reasoning_tokens ??
+    usage.completion_tokens_details?.reasoning_tokens
+  );
+  const cacheWrite = num(
+    usage.cache_creation_input_tokens ??
+    usage.cache_write_input_tokens ??
+    usage.input_tokens_details?.cache_write_tokens ??
+    usage.input_tokens_details?.cache_creation_tokens ??
+    usage.prompt_tokens_details?.cache_write_tokens ??
+    usage.prompt_tokens_details?.cache_creation_tokens
+  );
 
   let prompt = num(usage.prompt_tokens ?? usage.input_tokens);
   let cached;
 
-  // Claude path: prompt excludes cache; cache_read_input_tokens and/or
-  // cache_creation_input_tokens are separate. A cache-miss "first write" only
-  // carries cache_creation_input_tokens (no cache_read_input_tokens yet), so
-  // check both fields — otherwise a first-write request falls through to the
-  // OpenAI passthrough branch below and cache_creation never gets folded in.
-  // Guard on the absence of `cached_tokens`: our own canonical output always
-  // sets that key (even to 0), so re-running canonicalizeUsage on an already-
-  // folded result takes the passthrough branch instead of folding again.
   if (usage.cached_tokens === undefined &&
+      usage.input_tokens_details === undefined &&
+      usage.prompt_tokens_details === undefined &&
       (usage.cache_read_input_tokens !== undefined || usage.cache_creation_input_tokens !== undefined)) {
     cached = num(usage.cache_read_input_tokens);
-    prompt = prompt + cached + cacheCreation;
+    prompt += cached + cacheWrite;
   } else {
-    // OpenAI/Gemini path (or already-canonical input): prompt already includes cached_tokens.
-    cached = num(usage.cached_tokens);
+    cached = num(
+      usage.cached_tokens ??
+      usage.input_tokens_details?.cached_tokens ??
+      usage.prompt_tokens_details?.cached_tokens
+    );
   }
 
   const result = {
     prompt_tokens: prompt,
     completion_tokens: completion,
-    // Recompute rather than pass through: when the fold branch ran above,
-    // an upstream total_tokens (cache-exclusive) would otherwise be stale.
     total_tokens: prompt + completion,
     cached_tokens: cached,
-    cache_creation_input_tokens: cacheCreation,
+    cache_creation_input_tokens: cacheWrite,
   };
   if (reasoning > 0) result.reasoning_tokens = reasoning;
+  if (typeof usage.service_tier === "string" && usage.service_tier) result.service_tier = usage.service_tier;
+  if (Number.isFinite(Number(usage.cost_usd))) result.cost_usd = Number(usage.cost_usd);
+  if (Number.isFinite(Number(usage.cost_in_usd))) result.cost_in_usd = Number(usage.cost_in_usd);
+  if (Number.isFinite(Number(usage.cost_in_usd_ticks))) result.cost_in_usd_ticks = Number(usage.cost_in_usd_ticks);
   return result;
 }
 
@@ -236,16 +242,14 @@ export function hasValidUsage(usage) {
 export function extractUsage(chunk) {
   if (!chunk || typeof chunk !== "object") return null;
 
-  // Claude format (message_start event): carries input_tokens + cache_read +
-  // cache_creation. message_delta later carries only the final output_tokens,
-  // so callers must MERGE (mergeUsage), not overwrite, to keep cache counts.
+  // Claude input/cache usage arrives at message_start; output arrives later.
   if (chunk.type === "message_start" && chunk.message?.usage && typeof chunk.message.usage === "object") {
-    const u = chunk.message.usage;
+    const usage = chunk.message.usage;
     return normalizeUsage({
-      prompt_tokens: u.input_tokens || 0,
-      completion_tokens: u.output_tokens || 0,
-      cache_read_input_tokens: u.cache_read_input_tokens,
-      cache_creation_input_tokens: u.cache_creation_input_tokens
+      prompt_tokens: usage.input_tokens || 0,
+      completion_tokens: usage.output_tokens || 0,
+      cache_read_input_tokens: usage.cache_read_input_tokens,
+      cache_creation_input_tokens: usage.cache_creation_input_tokens,
     });
   }
 
@@ -263,12 +267,24 @@ export function extractUsage(chunk) {
   if ((chunk.type === "response.completed" || chunk.type === "response.done") && chunk.response?.usage && typeof chunk.response.usage === "object") {
     const usage = chunk.response.usage;
     const cachedTokens = usage.input_tokens_details?.cached_tokens;
+    const cacheWriteTokens = usage.input_tokens_details?.cache_write_tokens ??
+      usage.input_tokens_details?.cache_creation_tokens;
     return normalizeUsage({
       prompt_tokens: usage.input_tokens || usage.prompt_tokens || 0,
       completion_tokens: usage.output_tokens || usage.completion_tokens || 0,
       cached_tokens: cachedTokens,
+      cache_creation_input_tokens: cacheWriteTokens,
       reasoning_tokens: usage.output_tokens_details?.reasoning_tokens,
-      prompt_tokens_details: cachedTokens ? { cached_tokens: cachedTokens } : undefined
+      service_tier: chunk.response.service_tier || usage.service_tier,
+      cost_usd: usage.cost_usd,
+      cost_in_usd: usage.cost_in_usd,
+      cost_in_usd_ticks: usage.cost_in_usd_ticks,
+      input_tokens_details: usage.input_tokens_details,
+      output_tokens_details: usage.output_tokens_details,
+      prompt_tokens_details: (cachedTokens || cacheWriteTokens) ? {
+        ...(cachedTokens ? { cached_tokens: cachedTokens } : {}),
+        ...(cacheWriteTokens ? { cache_write_tokens: cacheWriteTokens } : {}),
+      } : undefined
     });
   }
 
@@ -278,7 +294,13 @@ export function extractUsage(chunk) {
       prompt_tokens: chunk.usage.prompt_tokens,
       completion_tokens: chunk.usage.completion_tokens || 0,
       cached_tokens: chunk.usage.prompt_tokens_details?.cached_tokens || chunk.usage.prompt_cache_hit_tokens,
+      cache_creation_input_tokens: chunk.usage.prompt_tokens_details?.cache_write_tokens ??
+        chunk.usage.prompt_tokens_details?.cache_creation_tokens,
       reasoning_tokens: chunk.usage.completion_tokens_details?.reasoning_tokens,
+      service_tier: chunk.service_tier || chunk.usage.service_tier,
+      cost_usd: chunk.usage.cost_usd,
+      cost_in_usd: chunk.usage.cost_in_usd,
+      cost_in_usd_ticks: chunk.usage.cost_in_usd_ticks,
       prompt_tokens_details: chunk.usage.prompt_tokens_details,
       completion_tokens_details: chunk.usage.completion_tokens_details
     });
@@ -288,12 +310,13 @@ export function extractUsage(chunk) {
   // Antigravity wraps usageMetadata inside response: { response: { usageMetadata: {...} } }
   const usageMeta = chunk.usageMetadata || chunk.response?.usageMetadata;
   if (usageMeta && typeof usageMeta === "object") {
+    const reasoningTokens = usageMeta.thoughtsTokenCount || 0;
     return normalizeUsage({
       prompt_tokens: usageMeta.promptTokenCount || 0,
-      completion_tokens: usageMeta.candidatesTokenCount || 0,
+      completion_tokens: (usageMeta.candidatesTokenCount || 0) + reasoningTokens,
       total_tokens: usageMeta.totalTokenCount,
       cached_tokens: usageMeta.cachedContentTokenCount,
-      reasoning_tokens: usageMeta.thoughtsTokenCount
+      reasoning_tokens: reasoningTokens
     });
   }
 
@@ -310,22 +333,20 @@ export function extractUsage(chunk) {
   return null;
 }
 
-// Field-wise max-merge of two usage objects. Anthropic splits usage across
-// events: message_start has real input+cache (output is a placeholder 1),
-// message_delta has the real cumulative output (input/cache absent). Max keeps
-// the meaningful value from each without clobbering. Idempotent for other
-// providers that emit a single complete usage object.
+// Anthropic splits input/cache and final output across different SSE events.
 export function mergeUsage(prev, next) {
   if (!prev) return next || null;
   if (!next) return prev;
   const merged = { ...prev };
-  for (const [k, v] of Object.entries(next)) {
-    // typeof NaN === "number" — guard with Number.isFinite so one malformed
-    // chunk can't poison the whole accumulation (Math.max(x, NaN) is NaN).
-    if (typeof v === "number" && Number.isFinite(v)) {
-      merged[k] = Math.max(typeof merged[k] === "number" ? merged[k] : 0, v);
-    } else if (v && typeof v === "object") {
-      merged[k] = v; // nested details objects: take latest
+  for (const [key, value] of Object.entries(next)) {
+    if (typeof value === "number") {
+      if (Number.isFinite(value)) {
+        merged[key] = Math.max(typeof merged[key] === "number" ? merged[key] : 0, value);
+      }
+    } else if (value && typeof value === "object") {
+      merged[key] = { ...(merged[key] || {}), ...value };
+    } else if (value !== undefined && value !== null) {
+      merged[key] = value;
     }
   }
   return merged;
@@ -425,10 +446,15 @@ export function logUsage(provider, usage, model = null, connectionId = null, api
   }
 
   // Add cache info if present (unified from different formats)
-  const cacheRead = usage.cache_read_input_tokens || usage.cached_tokens || usage.prompt_tokens_details?.cached_tokens;
+  const cacheRead = usage.cache_read_input_tokens || usage.cached_tokens ||
+    usage.input_tokens_details?.cached_tokens || usage.prompt_tokens_details?.cached_tokens;
   if (cacheRead) msg += ` | cache_read=${cacheRead}`;
 
-  const cacheCreation = usage.cache_creation_input_tokens;
+  const cacheCreation = usage.cache_creation_input_tokens ||
+    usage.input_tokens_details?.cache_write_tokens ||
+    usage.input_tokens_details?.cache_creation_tokens ||
+    usage.prompt_tokens_details?.cache_write_tokens ||
+    usage.prompt_tokens_details?.cache_creation_tokens;
   if (cacheCreation) msg += ` | cache_create=${cacheCreation}`;
 
   const reasoning = usage.reasoning_tokens;

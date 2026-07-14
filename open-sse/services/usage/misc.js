@@ -313,3 +313,10 @@ export async function getQoderUsage(accessToken, proxyOptions = null) {
     return { message: `Qoder connected. Unable to fetch usage: ${error.message}` };
   }
 }
+
+export async function getGrokWebUsage() {
+  return {
+    message: "Grok Web connected. Subscription quota is not exposed by a stable usage API; local request usage is tracked by 9Router.",
+    quotas: {},
+  };
+}

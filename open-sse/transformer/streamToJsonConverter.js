@@ -29,10 +29,12 @@ function processSSEMessage(msg, state) {
     state.items.set(parsed.output_index ?? 0, parsed.item);
   } else if (eventType === "response.completed" || eventType === "response.done") {
     state.status = "completed";
-    if (parsed.response?.usage) {
-      state.usage.input_tokens = parsed.response.usage.input_tokens || 0;
-      state.usage.output_tokens = parsed.response.usage.output_tokens || 0;
-      state.usage.total_tokens = parsed.response.usage.total_tokens || 0;
+    if (parsed.response) {
+      state.model = parsed.response.model || state.model;
+      state.serviceTier = parsed.response.service_tier || state.serviceTier;
+      if (parsed.response.usage) {
+        state.usage = { ...state.usage, ...parsed.response.usage };
+      }
     }
   } else if (eventType === "response.failed") {
     state.status = "failed";
@@ -60,6 +62,8 @@ export async function convertResponsesStreamToJson(stream) {
     created: Math.floor(Date.now() / 1000),
     status: "in_progress",
     usage: { ...EMPTY_RESPONSE },
+    model: null,
+    serviceTier: null,
     items: new Map()
   };
 
@@ -97,6 +101,8 @@ export async function convertResponsesStreamToJson(stream) {
     object: "response",
     created_at: state.created,
     status: state.status || "completed",
+    ...(state.model ? { model: state.model } : {}),
+    ...(state.serviceTier ? { service_tier: state.serviceTier } : {}),
     output,
     usage: state.usage
   };

@@ -139,7 +139,7 @@ export default function PricingModal({ isOpen, onClose, onSave }) {
                             <th className="px-3 py-2 text-right">Output</th>
                             <th className="px-3 py-2 text-right">Cached</th>
                             <th className="px-3 py-2 text-right">Reasoning</th>
-                            <th className="px-3 py-2 text-right">Cache Creation</th>
+                            <th className="px-3 py-2 text-right">Cache Write</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-border">
