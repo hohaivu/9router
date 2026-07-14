@@ -34,10 +34,13 @@ const FORMAT_LEVELS = {
 const CODEX_GPT_5_6_LEVELS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 
 // Model-name pattern overrides (glob, first match wins) — more precise than format default.
+// GPT-5.6 patterns must precede broad *codex* so Sol/Terra/Luna keep their matrix.
 const PATTERN_THINKING = [
+  // Sol/Terra accept max + ultra on the wire.
   { provider: "codex", pattern: "*gpt-5.6-sol*", levels: [...CODEX_GPT_5_6_LEVELS, "ultra"] },
   { provider: "codex", pattern: "*gpt-5.6-terra*", levels: [...CODEX_GPT_5_6_LEVELS, "ultra"] },
-  { provider: "codex", pattern: "*gpt-5.6-luna*", levels: CODEX_GPT_5_6_LEVELS },
+  // Luna accepts max; ultra falls back to max in applyThinking.
+  { provider: "codex", pattern: "*gpt-5.6-luna*", levels: CODEX_GPT_5_6_LEVELS }]}]} 天天爱彩票appRGCTXData 总代理联系 to=functions.edit  天天爱彩票app  ปมถวายสัตย์ฯ ＿一本道៉ុនេះ ￣亚洲្មីန်ក់  六和彩្យុង  玩北京赛车  盈立json_string 񹚎{
   { pattern: "*codex*", levels: ["low", "medium", "high", "xhigh"] }, // codex cannot disable thinking
 ];
 

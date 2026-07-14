@@ -7,6 +7,7 @@ import {
 } from "../services/oauthCredentialManager.js";
 import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
+import { resolveOpenAiEffort } from "../translator/concerns/thinkingUnified.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
 import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
@@ -24,6 +25,8 @@ const CODEX_SSE_USER_OUTPUT_PATTERNS = [
 ];
 const CODEX_SSE_PEEK_BYTES = 256 * 1024;
 const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try a different model.";
+const CODEX_PRIORITY_SHORT_CONTEXT_LIMIT = 272_000;
+const CODEX_PRIORITY_ESTIMATED_INPUT_LIMIT = 256_000;
 
 const CODEX_DEFAULT_REASONING_EFFORT = "medium";
 
@@ -145,12 +148,60 @@ function resolveCacheSessionId(body, credentials) {
   });
 }
 
-function normalizeReasoningEffort(model, value) {
-  const supportedLevels = getThinkingLevels("codex", model);
-  if (supportedLevels?.includes(value)) return value;
-  if (value === "ultra" && supportedLevels?.includes("max")) return "max";
-  if (value === "max" || value === "ultra") return "xhigh";
-  return value;
+// Apply Codex transport-level effort aliases after model-aware semantic resolution.
+// Official openai/codex serializes semantic Ultra as Max for requests; other efforts identity-map.
+function resolveCodexWireEffort(effort, config) {
+  const aliases = config?.quirks?.reasoningEffortAliases;
+  if (!aliases || effort == null) return effort;
+  return aliases[effort] ?? effort;
+}
+
+function supportsCodexFastTier(model) {
+  return /^gpt-5\.(?:4|5)(?:-|$)/.test(model || "");
+}
+
+function isEcmaWhitespace(code) {
+  return (code >= 0x09 && code <= 0x0d) || code === 0x20 || code === 0xa0 ||
+    code === 0x1680 || (code >= 0x2000 && code <= 0x200a) ||
+    code === 0x2028 || code === 0x2029 || code === 0x202f ||
+    code === 0x205f || code === 0x3000 || code === 0xfeff;
+}
+
+// ponytail: Codex sends no input-token count; replace this lexical estimate when one becomes available.
+function estimateCodexInputTokens(body, stopAt = Number.POSITIVE_INFINITY) {
+  let json;
+  try {
+    json = JSON.stringify(body);
+  } catch {
+    return 0;
+  }
+
+  let asciiChars = 0;
+  let whitespaceExtraTokens = 0;
+  let unicodeTokens = 0;
+  let asciiWhitespaceRun = 0;
+  for (let i = 0; i < json.length; i++) {
+    const code = json.charCodeAt(i);
+    if (code <= 0x7f) asciiChars += 1;
+    else unicodeTokens += 1;
+
+    if (isEcmaWhitespace(code)) {
+      if (code <= 0x7f) asciiWhitespaceRun += 1;
+    } else if (asciiWhitespaceRun) {
+      // Raises long ASCII whitespace from 1 token per 5 chars to 1 per 4.
+      whitespaceExtraTokens += Math.floor(asciiWhitespaceRun / 20);
+      asciiWhitespaceRun = 0;
+    }
+
+    // Keep bounded early exit without running several regexes per token-sized part.
+    if ((i & 4095) === 4095) {
+      const tokens = Math.ceil(asciiChars / 5) + whitespaceExtraTokens +
+        Math.floor(asciiWhitespaceRun / 20) + unicodeTokens;
+      if (tokens >= stopAt) return tokens;
+    }
+  }
+  whitespaceExtraTokens += Math.floor(asciiWhitespaceRun / 20);
+  return Math.ceil(asciiChars / 5) + whitespaceExtraTokens + unicodeTokens;
 }
 
 function findNestedMessage(value, depth = 0) {
@@ -497,7 +548,7 @@ export class CodexExecutor extends BaseExecutor {
 
     // Extract thinking level from model name suffix
     // e.g., gpt-5.3-codex-high → high, gpt-5.3-codex → medium (default)
-    const effortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'];
+    const effortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
     let modelEffort = null;
     for (const level of effortLevels) {
       if (body.model.endsWith(`-${level}`)) {
@@ -508,17 +559,22 @@ export class CodexExecutor extends BaseExecutor {
       }
     }
 
-    // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (medium)
+    // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (medium).
+    // resolveOpenAiEffort keeps model-aware semantic support (e.g. GPT-5.6 max/ultra);
+    // resolveCodexWireEffort then maps semantic Ultra → wire Max for Codex specifically.
     if (!body.reasoning) {
       // Claude Code does not always send reasoning_effort, so keep Codex
       // requests at the documented medium default unless configured.
-      const effort = normalizeReasoningEffort(
-        body.model,
+      const semantic = resolveOpenAiEffort(
         body.reasoning_effort || modelEffort || CODEX_DEFAULT_REASONING_EFFORT,
+        "codex",
+        body.model,
       );
+      const effort = resolveCodexWireEffort(semantic, this.config);
       body.reasoning = { effort, summary: "auto" };
     } else {
-      body.reasoning.effort = normalizeReasoningEffort(body.model, body.reasoning.effort);
+      const semantic = resolveOpenAiEffort(body.reasoning.effort, "codex", body.model);
+      body.reasoning.effort = resolveCodexWireEffort(semantic, this.config);
       if (!body.reasoning.summary) body.reasoning.summary = "auto";
     }
     delete body.reasoning_effort;
@@ -547,7 +603,23 @@ export class CodexExecutor extends BaseExecutor {
     delete body.safety_identifier; // Droid CLI sends this but Codex doesn't support it
     delete body.previous_response_id; // store=false → backend can't resolve previous resp; avoid 404
 
-    if (body.service_tier === "fast") body.service_tier = "priority";
+    if (body.service_tier === "fast") {
+      if (supportsCodexFastTier(body.model)) body.service_tier = "priority";
+      else delete body.service_tier;
+    }
+    if (body.service_tier === "priority" && /^gpt-/.test(body.model)) {
+      if (!supportsCodexFastTier(body.model)) {
+        delete body.service_tier;
+      } else {
+        const estimatedInputTokens = estimateCodexInputTokens(body, CODEX_PRIORITY_ESTIMATED_INPUT_LIMIT);
+        if (estimatedInputTokens >= CODEX_PRIORITY_ESTIMATED_INPUT_LIMIT) {
+          delete body.service_tier;
+          console.log(
+            `[Codex] Priority disabled for long context | estimated_input>=${CODEX_PRIORITY_ESTIMATED_INPUT_LIMIT} | short_limit=${CODEX_PRIORITY_SHORT_CONTEXT_LIMIT}`,
+          );
+        }
+      }
+    }
     if (body.service_tier && body.service_tier !== "priority") delete body.service_tier;
 
     // Final allowlist filter — strip any unknown field that could trigger upstream "routing_unsupported"
