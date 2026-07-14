@@ -76,6 +76,18 @@ function stripStoredItemReferences(body) {
   });
 }
 
+// Only `message` items may carry `content` in the Responses schema. Clients that
+// resend reasoning/function_call items with a stray `content` field (newer
+// Responses-native shape) trip a strict "Unknown parameter" 400 on gpt-5.x.
+function stripNonMessageContent(body) {
+  if (!Array.isArray(body.input)) return;
+  for (const item of body.input) {
+    if (item && typeof item === "object" && item.type && item.type !== "message" && "content" in item) {
+      delete item.content;
+    }
+  }
+}
+
 // Flatten Chat-Completions tool shape into Responses flat format + filter unsupported tools
 function normalizeCodexTools(body) {
   if (!Array.isArray(body.tools)) return;
@@ -454,6 +466,8 @@ export class CodexExecutor extends BaseExecutor {
     convertSystemToDeveloperRole(body);
     // Strip server-generated item IDs (rs_/fc_/resp_/msg_) — Codex /responses can't resolve when store=false
     stripStoredItemReferences(body);
+    // Strip stray `content` from non-message items (reasoning etc.) — rejected by gpt-5.x
+    stripNonMessageContent(body);
     // Flatten function tools + drop unsupported types
     normalizeCodexTools(body);
 

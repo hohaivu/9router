@@ -4,6 +4,8 @@ import { proxyAwareFetch } from "../utils/proxyFetch.js";
 import { dbg } from "../utils/debugLog.js";
 import { ANTHROPIC_API_VERSION, OPENAI_COMPAT_BASE, ANTHROPIC_COMPAT_BASE } from "../providers/shared.js";
 import { resolveOpenAICompatibleApiType } from "../services/provider.js";
+import { parseSSELine, formatSSE } from "../utils/streamHelpers.js";
+import { SSE_DONE } from "../utils/sseConstants.js";
 
 /**
  * BaseExecutor - Base class for provider executors
@@ -181,6 +183,98 @@ export class BaseExecutor {
     }
 
     throw lastError || new Error(`All ${fallbackCount} URLs failed with status ${lastStatus}`);
+  }
+
+  // Shared /responses escalation path (originally GitHub Copilot #1062, reused by OpenAI).
+  // Translates a Chat Completions body to Responses API format, sends it to
+  // this.config.responsesUrl, and streams the response back translated to chat SSE.
+  async executeWithResponsesEndpoint({ model, body, stream, credentials, signal, log, proxyOptions = null }) {
+    // Lazy imports: translator/index.js pulls in executors/antigravity.js, which
+    // extends BaseExecutor — a static top-level import here would create an
+    // import cycle back into this still-evaluating module.
+    const { openaiToOpenAIResponsesRequest } = await import("../translator/request/openai-responses.js");
+    const { openaiResponsesToOpenAIResponse } = await import("../translator/response/openai-responses.js");
+    const { initState } = await import("../translator/index.js");
+
+    const url = this.config.responsesUrl;
+    const headers = this.buildHeaders(credentials, stream);
+
+    const transformedBody = openaiToOpenAIResponsesRequest(model, body, stream, credentials);
+    this.finalizeResponsesBody?.(transformedBody);
+
+    log?.debug(this.provider.toUpperCase(), "Sending translated request to /responses");
+
+    const response = await proxyAwareFetch(url, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(transformedBody),
+      signal
+    }, proxyOptions);
+
+    if (!response.ok) {
+      return { response, url, headers, transformedBody };
+    }
+
+    const state = initState("openai-responses");
+    state.model = model;
+
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    const transformStream = new TransformStream({
+      async transform(chunk, controller) {
+        buffer += decoder.decode(chunk, { stream: true });
+        const lines = buffer.split("\n");
+
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) continue;
+
+          const parsed = parseSSELine(trimmed);
+          if (!parsed) continue;
+
+          if (parsed.done && stream === true) {
+            controller.enqueue(new TextEncoder().encode(SSE_DONE));
+            continue;
+          }
+
+          const converted = openaiResponsesToOpenAIResponse(parsed, state);
+          if (converted) {
+            const sseString = formatSSE(converted, "openai");
+            controller.enqueue(new TextEncoder().encode(sseString));
+          }
+        }
+      },
+      flush(controller) {
+        if (buffer.trim()) {
+          const parsed = parseSSELine(buffer.trim());
+          if (parsed && !parsed.done) {
+            const converted = openaiResponsesToOpenAIResponse(parsed, state);
+            if (converted) {
+              controller.enqueue(new TextEncoder().encode(formatSSE(converted, "openai")));
+            }
+          }
+        }
+      }
+    });
+
+    if (!response.body) {
+      return { response: new Response("", { status: response.status, headers: response.headers }), url, headers, transformedBody };
+    }
+    const convertedStream = response.body.pipeThrough(transformStream);
+
+    return {
+      response: new Response(convertedStream, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: response.headers
+      }),
+      url,
+      headers,
+      transformedBody
+    };
   }
 }
 
