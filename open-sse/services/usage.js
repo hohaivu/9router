@@ -57,7 +57,7 @@ const USAGE_HANDLERS = {
   kimi: (c) => getKimiUsage(c.accessToken, c.apiKey, c.proxyOptions, c.providerSpecificData),
   deepseek: (c) => getDeepseekUsage(c.apiKey, c.proxyOptions),
   xai: (c) => getXaiUsage(c.connectionId),
-  "grok-web": () => getGrokWebUsage(),)
+  "grok-web": () => getGrokWebUsage(),
 };
 
 export async function getUsageForProvider(connection, proxyOptions = null) {

@@ -159,37 +159,7 @@ describe("CodexExecutor image handling", () => {
     expect(imgBlock.image_url.startsWith("data:image/jpeg;base64,")).toBe(true);
   });
 
-  it("aborts a request that receives no initial upstream response within 7 seconds", async () => {
-    vi.useFakeTimers();
-
-    vi.spyOn(proxyFetchModule, "proxyAwareFetch").mockImplementation((_url, init) => (
-      new Promise((_resolve, reject) => {
-        init.signal.addEventListener("abort", () => {
-          const error = new Error("aborted");
-          error.name = "AbortError";
-          reject(error);
-        }, { once: true });
-      })
-    ));
-
-    const executor = new CodexExecutor();
-    const pending = executor.execute({
-      model: "gpt-5.5",
-      body: { input: [{ role: "user", content: [{ type: "input_text", text: "ping" }] }] },
-      stream: true,
-      credentials: { accessToken: "test" },
-    });
-    const assertion = expect(pending).rejects.toMatchObject({
-      name: "UpstreamResponseTimeoutError",
-      status: 504,
-    });
-
-    await vi.advanceTimersByTimeAsync(7000);
-    await assertion;
-    vi.useRealTimers();
-  });
-
-  it("preserves a caller abort as AbortError rather than an upstream timeout", async () => {
+  it("preserves a caller abort as AbortError", async () => {
     vi.spyOn(proxyFetchModule, "proxyAwareFetch").mockImplementation((_url, init) => (
       new Promise((_resolve, reject) => {
         const rejectAbort = () => {

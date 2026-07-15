@@ -9,7 +9,6 @@ import { normalizeResponsesInput } from "../translator/formats/responsesApi.js";
 import { fetchImageAsBase64 } from "../translator/concerns/image.js";
 import { resolveOpenAiEffort } from "../translator/concerns/thinkingUnified.js";
 import { getModelUpstreamId } from "../config/providerModels.js";
-import { getThinkingLevels } from "../providers/thinkingLevels.js";
 import { DEFAULT_RETRY_CONFIG, HTTP_STATUS, resolveRetryEntry } from "../config/runtimeConfig.js";
 import { dbg } from "../utils/debugLog.js";
 import { resolveSessionId } from "../utils/sessionManager.js";
@@ -28,13 +27,7 @@ const CODEX_MODEL_CAPACITY_MESSAGE = "Selected model is at capacity. Please try 
 const CODEX_PRIORITY_SHORT_CONTEXT_LIMIT = 272_000;
 const CODEX_PRIORITY_ESTIMATED_INPUT_LIMIT = 256_000;
 
-const CODEX_DEFAULT_REASONING_EFFORT = "medium";
-
-const configuredInitialResponseTimeoutMs = Number(process.env.CODEX_INITIAL_RESPONSE_TIMEOUT_MS);
-const CODEX_INITIAL_RESPONSE_TIMEOUT_MS = Number.isFinite(configuredInitialResponseTimeoutMs) && configuredInitialResponseTimeoutMs >= 0
-  ? configuredInitialResponseTimeoutMs
-  : 7 * 1000;
-
+const CODEX_DEFAULT_REASONING_EFFORT = "low";
 
 // Server-generated item id prefixes that Codex /responses cannot resolve when store=false
 const SERVER_ID_PATTERN = /^(rs|fc|resp|msg)_/;
@@ -149,7 +142,6 @@ function resolveCacheSessionId(body, credentials) {
 }
 
 // Apply Codex transport-level effort aliases after model-aware semantic resolution.
-// Official openai/codex serializes semantic Ultra as Max for requests; other efforts identity-map.
 function resolveCodexWireEffort(effort, config) {
   const aliases = config?.quirks?.reasoningEffortAliases;
   if (!aliases || effort == null) return effort;
@@ -344,7 +336,7 @@ export class CodexExecutor extends BaseExecutor {
     const { attempts, delayMs } = resolveRetryEntry(retryConfig[503]);
     let attempt = 0;
     while (true) {
-      const result = await this._executeWithInitialTimeout(args);
+      const result = await super.execute(args);
       const peek = await this._peekSseTransientError(result.response);
       if (!peek.matched) {
         // Replace body with re-assembled stream (prefix bytes already read + rest)
@@ -371,44 +363,6 @@ export class CodexExecutor extends BaseExecutor {
       args.log?.debug?.("RETRY", `CODEX | SSE "${peek.matched}" retry ${attempt}/${attempts} after ${delayMs / 1000}s`);
       dbg("CODEX", `SSE overloaded "${peek.matched}" → retry ${attempt}/${attempts} in ${delayMs}ms`);
       await new Promise(r => setTimeout(r, delayMs));
-    }
-  }
-
-  // Wrap super.execute with a TTFT (time-to-first-token) timeout. Aborts upstream if no
-  // initial response within CODEX_INITIAL_RESPONSE_TIMEOUT_MS; 0 disables the timeout.
-  async _executeWithInitialTimeout(args) {
-    if (CODEX_INITIAL_RESPONSE_TIMEOUT_MS === 0) {
-      return super.execute(args);
-    }
-
-    const upstreamController = new AbortController();
-    let initialResponseTimedOut = false;
-    const abortFromClient = () => upstreamController.abort(args.signal?.reason);
-
-    if (args.signal?.aborted) {
-      abortFromClient();
-    } else {
-      args.signal?.addEventListener("abort", abortFromClient, { once: true });
-    }
-
-    const timeout = setTimeout(() => {
-      initialResponseTimedOut = true;
-      upstreamController.abort();
-    }, CODEX_INITIAL_RESPONSE_TIMEOUT_MS);
-
-    try {
-      return await super.execute({ ...args, signal: upstreamController.signal });
-    } catch (error) {
-      if (initialResponseTimedOut) {
-        const timeoutError = new Error(`Codex initial response timeout after ${CODEX_INITIAL_RESPONSE_TIMEOUT_MS}ms`);
-        timeoutError.name = "UpstreamResponseTimeoutError";
-        timeoutError.status = 504;
-        throw timeoutError;
-      }
-      throw error;
-    } finally {
-      clearTimeout(timeout);
-      args.signal?.removeEventListener("abort", abortFromClient);
     }
   }
 
@@ -547,7 +501,7 @@ export class CodexExecutor extends BaseExecutor {
     }
 
     // Extract thinking level from model name suffix
-    // e.g., gpt-5.3-codex-high → high, gpt-5.3-codex → medium (default)
+    // e.g., gpt-5.3-codex-high → high, gpt-5.3-codex → low (default)
     const effortLevels = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'];
     let modelEffort = null;
     for (const level of effortLevels) {
@@ -559,22 +513,14 @@ export class CodexExecutor extends BaseExecutor {
       }
     }
 
-    // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (medium).
-    // resolveOpenAiEffort keeps model-aware semantic support (e.g. GPT-5.6 max/ultra);
-    // resolveCodexWireEffort then maps semantic Ultra → wire Max for Codex specifically.
-    if (!body.reasoning) {
-      // Claude Code does not always send reasoning_effort, so keep Codex
-      // requests at the documented medium default unless configured.
-      const semantic = resolveOpenAiEffort(
-        body.reasoning_effort || modelEffort || CODEX_DEFAULT_REASONING_EFFORT,
-        "codex",
-        body.model,
-      );
-      const effort = resolveCodexWireEffort(semantic, this.config);
+    // Priority: explicit reasoning.effort > reasoning_effort param > model suffix > default (low).
+    const requested = body.reasoning?.effort ?? body.reasoning_effort ?? modelEffort ?? CODEX_DEFAULT_REASONING_EFFORT;
+    const semantic = resolveOpenAiEffort(requested, "codex", body.model);
+    const effort = resolveCodexWireEffort(semantic, this.config);
+    if (!body.reasoning || typeof body.reasoning !== "object" || Array.isArray(body.reasoning)) {
       body.reasoning = { effort, summary: "auto" };
     } else {
-      const semantic = resolveOpenAiEffort(body.reasoning.effort, "codex", body.model);
-      body.reasoning.effort = resolveCodexWireEffort(semantic, this.config);
+      body.reasoning.effort = effort;
       if (!body.reasoning.summary) body.reasoning.summary = "auto";
     }
     delete body.reasoning_effort;

@@ -1,49 +1,108 @@
-import { describe, expect, it, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 
-vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
-  proxyAwareFetch: vi.fn(async () => new Response("", { status: 200, headers: { "Content-Type": "text/event-stream" } })),
-}));
+/**
+ * Outbound wire proof for Codex reasoning.effort.
+ * Official openai/codex: semantic Ultra serializes as Max for requests
+ * (ReasoningEffortConfig::Ultra => Max; ultra_reasoning_uses_max_for_requests).
+ * One POST, no adaptive retry, wire value never "ultra".
+ */
 
-import { proxyAwareFetch } from "../../open-sse/utils/proxyFetch.js";
-import { CodexExecutor } from "../../open-sse/executors/codex.js";
+const CODEX_URL = "https://chatgpt.com/backend-api/codex/responses";
 
-const CREDENTIALS = { accessToken: "token", connectionId: "conn_1" };
-
-async function sendAndCapture(model, extra) {
-  proxyAwareFetch.mockClear();
-  const executor = new CodexExecutor();
-  await executor.execute({
-    model,
-    body: { model, input: "hi", ...extra },
-    stream: true,
-    credentials: CREDENTIALS,
+function normalSseResponse() {
+  const text = [
+    "event: response.output_text.delta",
+    'data: {"type":"response.output_text.delta","delta":"ok"}',
+    "",
+    "event: response.completed",
+    'data: {"type":"response.completed"}',
+    "",
+  ].join("\n");
+  return new Response(text, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
   });
-  const [, init] = proxyAwareFetch.mock.calls[0];
-  return JSON.parse(init.body);
 }
 
-// End-to-end guard (complements the transformRequest-level matrix in
-// codex-fast-capacity.test.js): confirms the actual outbound POST body sent
-// to Codex carries the resolved wire effort, not just the return value of
-// transformRequest in isolation.
-describe("Codex outbound wire effort", () => {
-  it.each([
-    ["gpt-5.6-sol", "max", "max"],
-    ["gpt-5.6-sol", "ultra", "max"],
-    ["gpt-5.6-terra", "ultra", "max"],
-    ["gpt-5.5", "ultra", "xhigh"],
-  ])("%s reasoning_effort=%s → wire reasoning.effort=%s", async (model, requested, expected) => {
-    const body = await sendAndCapture(model, { reasoning_effort: requested });
-    expect(body.reasoning.effort).toBe(expected);
+const proxyAwareFetch = vi.fn(async () => normalSseResponse());
+
+vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
+  proxyAwareFetch,
+}));
+
+describe("Codex effort wire encoding (official Ultra→Max)", () => {
+  beforeEach(() => {
+    proxyAwareFetch.mockClear();
+    proxyAwareFetch.mockImplementation(async () => normalSseResponse());
   });
 
-  // Case-sensitive alias lookup: uppercase "ULTRA"/"Ultra" don't match the
-  // lowercase-only reasoningEffortAliases map, so they pass through untouched.
-  it("does not promote uppercase ULTRA/Ultra (case-sensitive alias lookup)", async () => {
-    const upper = await sendAndCapture("gpt-5.5", { reasoning_effort: "ULTRA" });
-    expect(upper.reasoning.effort).toBe("ULTRA");
+  async function executeWithEffort(model, effortFields) {
+    const { CodexExecutor } = await import("../../open-sse/executors/codex.js");
+    const executor = new CodexExecutor();
+    return executor.execute({
+      model,
+      body: {
+        model,
+        input: "hi",
+        ...effortFields,
+      },
+      stream: true,
+      credentials: {
+        accessToken: "test-token",
+        connectionId: "conn_test",
+        providerSpecificData: { chatgptAccountId: "acct_test" },
+      },
+      log: null,
+    });
+  }
 
-    const mixed = await sendAndCapture("gpt-5.5", { reasoning_effort: "Ultra" });
-    expect(mixed.reasoning.effort).toBe("Ultra");
+  function parsePostedBody() {
+    expect(proxyAwareFetch).toHaveBeenCalledTimes(1);
+    const [url, options] = proxyAwareFetch.mock.calls[0];
+    expect(url).toBe(CODEX_URL);
+    expect(options.method).toBe("POST");
+    return JSON.parse(options.body);
+  }
+
+  it("posts exactly once with reasoning.effort=max for Sol ultra intent", async () => {
+    await executeWithEffort("gpt-5.6-sol", { reasoning: { effort: "ultra" } });
+
+    const body = parsePostedBody();
+    expect(body.reasoning.effort).toBe("max");
+    expect(body.reasoning.effort).not.toBe("ultra");
+    expect(body.reasoning.effort).not.toBe("xhigh");
+    expect(body.model).toBe("gpt-5.6-sol");
+  });
+
+  it("posts exactly once with reasoning.effort=max for explicit Sol max", async () => {
+    await executeWithEffort("gpt-5.6-sol", { reasoning: { effort: "max" } });
+
+    const body = parsePostedBody();
+    expect(body.reasoning.effort).toBe("max");
+    expect(body.model).toBe("gpt-5.6-sol");
+  });
+
+  it("posts max for Terra ultra via legacy reasoning_effort", async () => {
+    await executeWithEffort("gpt-5.6-terra", { reasoning_effort: "ultra" });
+
+    const body = parsePostedBody();
+    expect(body.reasoning.effort).toBe("max");
+    expect(body.model).toBe("gpt-5.6-terra");
+  });
+
+  it("posts max for Sol-ultra model suffix (suffix stripped)", async () => {
+    await executeWithEffort("gpt-5.6-sol-ultra", {});
+
+    const body = parsePostedBody();
+    expect(body.model).toBe("gpt-5.6-sol");
+    expect(body.reasoning.effort).toBe("max");
+  });
+
+  it("does not promote an uppercase unknown effort through the wire alias", async () => {
+    await executeWithEffort("gpt-5.5", { reasoning: { effort: "ULTRA" } });
+
+    const body = parsePostedBody();
+    expect(body.reasoning.effort).toBe("ULTRA");
+    expect(body.reasoning.effort).not.toBe("max");
   });
 });
