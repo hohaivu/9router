@@ -42,6 +42,11 @@ export default {
     quirks: {
       reasoningEffortAliases: { ultra: "max" },
     },
+    // Codex backend intermittently returns a 400 naming a param we never send
+    // (e.g. prompt_cache_retention). Retry once on the same account before locking it.
+    retry: {
+      400: { attempts: 1, delayMs: 500 },
+    },
     usage: {
       url: "https://chatgpt.com/backend-api/wham/usage",
       resetCreditsUrl: "https://chatgpt.com/backend-api/wham/rate-limit-reset-credits",

@@ -45,6 +45,23 @@ describe("BaseExecutor.execute — retry by status (config-driven)", () => {
   });
 });
 
+describe("BaseExecutor.execute — retry on 400 (phantom upstream param rejection)", () => {
+  it("retries a config-enabled 400 once on the same url before giving up", async () => {
+    const ex = makeExec({ baseUrl: "https://x/api", retry: { 400: { attempts: 1, delayMs: 0 } } });
+    fetchMock
+      .mockResolvedValueOnce(res(400))
+      .mockResolvedValueOnce(res(200));
+    const out = await ex.execute({ model: "m", body: {}, stream: false, credentials: creds });
+    expect(out.response.status).toBe(200);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("codex provider registry declares a 400 retry (root-cause fix for VUH-130)", async () => {
+    const { PROVIDERS } = await import("../../open-sse/config/providers.js");
+    expect(PROVIDERS.codex.retry?.[400]).toEqual({ attempts: 1, delayMs: 500 });
+  });
+});
+
 describe("BaseExecutor.execute — baseUrls fallback", () => {
   it("falls over to the next url on 429 (shouldRetry)", async () => {
     const ex = makeExec({ baseUrls: ["https://a/api", "https://b/api"], retry: { 429: { attempts: 0 } } });

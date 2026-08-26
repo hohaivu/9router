@@ -1,132 +1,135 @@
 # Docker
 
-Run 9Router in a container. Published image: [`decolua/9router`](https://hub.docker.com/r/decolua/9router) — multi-platform `linux/amd64` + `linux/arm64`.
+Run 9Router from a published image or build the repository locally. Both modes persist state at `/app/data`.
+
+> **Keep the data volume.** It contains the SQLite database, certificates, runtime configuration, and generated secrets. Updating a container does not require deleting its volume.
 
 ---
 
-# 👤 For Users
-
-## Quick start
+# User deployment: published image
 
 ```bash
+mkdir 9router && cd 9router
+curl -fsSLO https://raw.githubusercontent.com/decolua/9router/main/.env.example
+cp .env.example .env
+# Replace every required placeholder in .env, then:
+chmod 600 .env
+
 docker run -d \
-  -p 20128:20128 \
-  -v "$HOME/.9router:/app/data" \
-  -e DATA_DIR=/app/data \
   --name 9router \
-  decolua/9router:latest
-```
-
-App listens on port `20128`. Open: http://localhost:20128
-
-## Manage container
-
-```bash
-docker logs -f 9router        # view logs
-docker stop 9router           # stop
-docker start 9router          # start again
-docker rm -f 9router          # remove
-```
-
-## Data persistence
-
-```bash
--v "$HOME/.9router:/app/data" \
--e DATA_DIR=/app/data
-```
-
-Without `DATA_DIR`, the app falls back to `~/.9router/` (macOS/Linux) or `%APPDATA%\9router\` (Windows). In the container, `DATA_DIR=/app/data` makes the bind mount work.
-
-Data layout under `$DATA_DIR/`:
-
-```text
-$DATA_DIR/
-├── db/
-│   ├── data.sqlite       # main SQLite database
-│   └── backups/          # auto backups
-└── ...                   # certs, logs, runtime configs
-```
-
-Host path: `$HOME/.9router/db/data.sqlite`
-Container path: `/app/data/db/data.sqlite`
-
-## Optional env vars
-
-```bash
-docker run -d \
-  -p 20128:20128 \
-  -v "$HOME/.9router:/app/data" \
+  --restart unless-stopped \
+  --env-file .env \
   -e DATA_DIR=/app/data \
   -e PORT=20128 \
   -e HOSTNAME=0.0.0.0 \
-  -e DEBUG=true \
-  --name 9router \
+  -p 20128:20128 \
+  -v 9router-data:/app/data \
   decolua/9router:latest
 ```
 
-## Optional Headroom sidecar
+Open <http://localhost:20128>.
 
-The 9Router image does not bundle Python or Headroom. To use Headroom in Docker, run it as a separate service and point 9Router at that proxy:
-
-```yaml
-services:
-  9router:
-    image: decolua/9router:latest
-    ports:
-      - "20128:20128"
-    volumes:
-      - "$HOME/.9router:/app/data"
-    environment:
-      DATA_DIR: /app/data
-      HEADROOM_URL: http://headroom:8787
-    depends_on:
-      - headroom
-
-  headroom:
-    image: ghcr.io/chopratejas/headroom:latest
-    ports:
-      - "8787:8787"
-```
-
-In the dashboard, open `Endpoint` → `Token Saver` → `Headroom`, confirm the URL is `http://headroom:8787`, recheck status, then enable Headroom.
-
-If Headroom runs on the Docker host instead of as a sidecar, use `http://host.docker.internal:8787` on macOS/Windows. On Linux, add `--add-host=host.docker.internal:host-gateway` or the equivalent compose `extra_hosts` entry.
-
-## Update to latest
+## Update a published image
 
 ```bash
 docker pull decolua/9router:latest
 docker rm -f 9router
-# re-run the quick start command
+docker run -d \
+  --name 9router \
+  --restart unless-stopped \
+  --env-file .env \
+  -e DATA_DIR=/app/data \
+  -e PORT=20128 \
+  -e HOSTNAME=0.0.0.0 \
+  -p 20128:20128 \
+  -v 9router-data:/app/data \
+  decolua/9router:latest
+```
+
+This recreates only the container. The `9router-data` volume remains intact.
+
+---
+
+# Repository deployment: local source build
+
+The repository's canonical local deployment definition is [`compose.yaml`](./compose.yaml). [`deploy.sh`](./deploy.sh) always uses this file; do not deploy the legacy [`docker-compose.yml`](./docker-compose.yml).
+
+```bash
+git clone https://github.com/decolua/9router.git
+cd 9router
+cp .env.example .env
+# Edit .env: replace required placeholders and set the public URL if applicable.
+chmod 600 .env
+./deploy.sh
+```
+
+`deploy.sh` validates Compose, rebuilds the local image, recreates only the `9router` service, and waits for its health check. It preserves the named volume `9router_9router-data`; never use `docker compose down --volumes` unless you deliberately intend to erase all 9Router data.
+
+Useful commands:
+
+```bash
+docker compose -f compose.yaml ps
+docker compose -f compose.yaml logs -f 9router
+docker compose -f compose.yaml config
+docker volume inspect 9router_9router-data
+```
+
+## Runtime configuration
+
+`.env` is deliberately ignored by Git and excluded from Docker build context. Do not commit it or put secrets in a Compose file.
+
+Required values:
+
+| Variable | Purpose |
+| --- | --- |
+| `JWT_SECRET` | Persistent secret that signs dashboard authentication cookies. |
+| `INITIAL_PASSWORD` | First dashboard password, until a password hash is saved in the database. |
+| `API_KEY_SECRET` | HMAC secret for generated API keys. |
+| `MACHINE_ID_SALT` | Salt used to derive the stable machine ID. |
+
+Generate a value with `openssl rand -hex 32` (or another cryptographically secure generator). For a public HTTPS deployment, set `BASE_URL` and `NEXT_PUBLIC_BASE_URL` to its externally reachable `https://` URL, set `AUTH_COOKIE_SECURE=true`, and generally set `REQUIRE_API_KEY=true`.
+
+`DATA_DIR` is fixed to `/app/data` by `compose.yaml`, regardless of an `.env` value, so the mounted persistent volume is always used.
+
+## Data persistence
+
+```text
+/app/data/
+├── db/
+│   ├── data.sqlite       # main SQLite database
+│   └── backups/          # auto backups
+├── certs/                # generated certificates, if used
+└── ...                   # runtime configs and logs
+```
+
+For the repository Compose project, Docker stores that data in the named volume `9router_9router-data`. Inspect it with:
+
+```bash
+docker volume inspect 9router_9router-data
 ```
 
 ---
 
-# 🛠 For Developers
+# Optional Headroom sidecar
 
-## Build image locally (test)
+The standard local deployment does **not** start Headroom. If you use an externally managed Headroom proxy, set `HEADROOM_URL` in `.env` to an address reachable from inside the 9Router container.
 
-```bash
-cd app && docker build -t 9router .
+- Docker Desktop (macOS/Windows) host service: `http://host.docker.internal:8787`
+- Docker Engine (Linux) host service: add an `extra_hosts` mapping for `host.docker.internal:host-gateway`, then use that URL
+- Compose sidecar: use its service DNS name, e.g. `http://headroom:8787`
 
-docker run --rm -p 20128:20128 \
-  -v "$HOME/.9router:/app/data" \
-  -e DATA_DIR=/app/data \
-  9router
-```
+In the dashboard, open `Endpoint` → `Token Saver` → `Headroom`, confirm the URL, recheck status, then enable Headroom. Do not set it to `localhost` for a host-side service: `localhost` inside the 9Router container refers to the container itself.
 
-## Publish (automatic via CI)
+---
 
-Push a git tag `v*` → GitHub Actions builds multi-platform (amd64+arm64) and pushes to:
-- `ghcr.io/decolua/9router:v{version}` + `:latest`
-- `decolua/9router:v{version}` + `:latest`
+# Container management
 
 ```bash
-# Use scripts/release.js (recommended)
-node scripts/release.js "Release title" "Notes"
-
-# Or manually
-git tag v0.4.x && git push origin v0.4.x
+docker logs -f 9router
+docker restart 9router
+docker stop 9router
+docker rm -f 9router             # safe for data; removes only the container
+docker volume rm 9router-data     # destructive; deletes all data
 ```
 
-Workflow: `app/.github/workflows/docker-publish.yml`
+The image listens on port `20128` with `HOSTNAME=0.0.0.0`.

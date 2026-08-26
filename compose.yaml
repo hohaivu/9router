@@ -25,4 +25,6 @@ services:
       start_period: 30s
 
 volumes:
+  # Keep the existing production volume stable across Compose updates.
   9router-data:
+    name: 9router_9router-data
